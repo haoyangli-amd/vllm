@@ -16,10 +16,10 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-__all__ = ["QuarkW4A4MXFP4"]
+__all__ = ["QuarkW4MXFP4"]
 
 
-class QuarkW4A4MXFP4(QuarkScheme):
+class QuarkW4MXFP4(QuarkScheme):
 
     def __init__(self, weight_quant_spec: dict[str, Any],
                  input_quant_spec: dict[str, Any]):
@@ -32,7 +32,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
 
         if self.static_input_scales:
             raise NotImplementedError(
-                "QuarkW4A4MXFP4 with static input scales is currently not "
+                "QuarkW4MXFP4 with static input scales is currently not "
                 "implemented. Please open an issue.")
 
         if not current_platform.supports_mx():
