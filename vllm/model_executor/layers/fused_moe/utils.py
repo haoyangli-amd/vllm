@@ -169,7 +169,8 @@ def _mxfp4_quantize(
     block_shape: Optional[list[int]] = None,
 ) -> tuple[torch.Tensor, None]:
     assert block_shape is None
-    if not current_platform.supports_mx():
+    # if not current_platform.supports_mx():
+    if 1:
         A = quant_dequant_mxfp4(A)
     else:
         raise NotImplementedError()
