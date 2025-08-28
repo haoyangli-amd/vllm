@@ -17,7 +17,7 @@ from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.quark.quark_moe import (  # noqa: E501
     QuarkMoEMethod)
 from vllm.model_executor.layers.quantization.quark.schemes import (
-    QuarkScheme, QuarkW4A4MXFP4, QuarkW8A8Fp8, QuarkW8A8Int8)
+    QuarkScheme, QuarkW4MXFP4, QuarkW8A8Fp8, QuarkW8A8Int8)
 from vllm.model_executor.layers.quantization.quark.utils import (
     deep_compare, should_ignore_layer)
 from vllm.platforms import current_platform
@@ -213,39 +213,36 @@ class QuarkConfig(QuantizationConfig):
     def _is_mx_fp4(self, weight_quant: Optional[dict[str, Any]],
                    input_quant: Optional[dict[str, Any]]) -> bool:
         # Confirm weights and input quantized.
-        if weight_quant is None or input_quant is None:
+        if weight_quant is None:
             logger.debug("Quark model is not in MX-FP4 format: "
                          "weight_quant or input_quant not set")
             return False
 
         # Input and weight dtype needs to be fp4.
-        if weight_quant.get("dtype") != "fp4" or input_quant.get(
-                "dtype") != "fp4":
+        if weight_quant.get("dtype") != "fp4":
             logger.debug("Quark model is not in MX-FP4 format: dtype not fp4")
             return False
 
         # Input and weight qscheme needs to be per group.
-        if weight_quant.get("qscheme") != "per_group" or input_quant.get(
-                "qscheme") != "per_group":
+        if weight_quant.get("qscheme") != "per_group":
             logger.debug("Quark model is not in MX-FP4 format: not per_group")
             return False
 
         # Input and weight group size needs to be 32.
-        if weight_quant.get("group_size") != 32 or input_quant.get(
-                "group_size") != 32:
+        if weight_quant.get("group_size") != 32:
             logger.debug(
                 "Quark model is not in MX-FP4 format: not group_size=32")
             return False
 
         # Activations need to use dynamic quantization.
-        if input_quant.get("is_dynamic") is False:
+        if input_quant is not None and input_quant.get("is_dynamic") is False:
             logger.debug(
                 "Quark model is not in MX-FP4 format: not activation dynamic")
             return False
 
         # Activations and weight scales need to be in e8m0 format.
-        if weight_quant.get("scale_format") != "e8m0" or input_quant.get(
-                "scale_format") != "e8m0":
+        if weight_quant.get("scale_format") != "e8m0" or (input_quant is not None and input_quant.get(
+                "scale_format") != "e8m0"):
             logger.debug(
                 "Quark model is not in MX-FP4 format: not scale_format e8m0")
             return False
@@ -313,7 +310,7 @@ class QuarkConfig(QuantizationConfig):
                                  is_static_input_scheme=True,
                                  input_symmetric=input_config.get("symmetric"))
         elif self._is_mx_fp4(weight_config, input_config):
-            return QuarkW4A4MXFP4(weight_config, input_config)
+            return QuarkW4MXFP4(weight_config, input_config)
 
         raise NotImplementedError("No quark compatible scheme was found. "
                                   f"Weight config: {weight_config}, "

@@ -1319,7 +1319,39 @@ class FusedMoE(torch.nn.Module):
                 tp_rank=self.tp_rank)
             return True if return_success else None
 
+        # return False if return_success else None
+        # Case model bias
+        if "bias" in weight_name: # we need this to load moe bias for gpt oss
+            self._load_model_bias(
+                shard_id=shard_id,
+                shard_dim=0, # it must 0 for bias
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=self.tp_rank)
+            return True if return_success else None
         return False if return_success else None
+
+    def _load_model_bias(self,
+                        shard_dim: int,
+                        expert_data: torch.Tensor,
+                        shard_id: str,
+                        loaded_weight: torch.Tensor,
+                        tp_rank: int,
+                        load_full_w2: bool = False):
+        if shard_id == "w2":
+            # In the case where we have actorder/g_idx, we do not partition the
+            # w2 scales, as indicated by `load_full` argument, for all tp cases
+            self._load_w2(shard_dim=shard_dim,
+                          loaded_weight=loaded_weight,
+                          expert_data=expert_data,
+                          tp_rank=tp_rank,
+                          load_full=load_full_w2)
+        elif shard_id in ("w1", "w3"):
+            self._load_w13(shard_id=shard_id,
+                           shard_dim=shard_dim,
+                           loaded_weight=loaded_weight,
+                           expert_data=expert_data,
+                           tp_rank=tp_rank)
 
     def get_expert_weights(self) -> Iterable[torch.Tensor]:
         weights = list(self.named_parameters())
