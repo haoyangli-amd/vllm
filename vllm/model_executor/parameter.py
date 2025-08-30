@@ -147,11 +147,16 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         param_data = self.data
         tp_rank = get_tensor_model_parallel_rank()
         shard_id = tp_rank if shard_id == "q" else tp_rank // num_heads
-        param_data = param_data.narrow(self.output_dim, shard_offset,
-                                       shard_size)
-        loaded_weight = loaded_weight.narrow(self.output_dim,
-                                             shard_id * shard_size, shard_size)
-
+        try:
+            param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
+        except:
+            breakpoint()
+        try:
+            loaded_weight = loaded_weight.narrow(self.output_dim, shard_id * shard_size, shard_size)
+        except:
+            breakpoint()
+        if param_data.shape != loaded_weight.shape:
+            pass
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 

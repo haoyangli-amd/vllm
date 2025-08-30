@@ -16,10 +16,10 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-__all__ = ["QuarkW4A4MXFP4"]
+__all__ = ["QuarkW4MXFP4"]
 
 
-class QuarkW4A4MXFP4(QuarkScheme):
+class QuarkW4MXFP4(QuarkScheme):
 
     def __init__(self, weight_quant_spec: dict[str, Any],
                  input_quant_spec: dict[str, Any]):
@@ -28,12 +28,12 @@ class QuarkW4A4MXFP4(QuarkScheme):
         self.weight_quant_spec = weight_quant_spec
         self.input_quant_spec = input_quant_spec
 
-        self.static_input_scales = not input_quant_spec.get("is_dynamic")
+        # self.static_input_scales = not input_quant_spec.get("is_dynamic")
 
-        if self.static_input_scales:
-            raise NotImplementedError(
-                "QuarkW4A4MXFP4 with static input scales is currently not "
-                "implemented. Please open an issue.")
+        # if self.static_input_scales:
+        #     raise NotImplementedError(
+        #         "QuarkW4MXFP4 with static input scales is currently not "
+        #         "implemented. Please open an issue.")
 
         if not current_platform.supports_mx():
             self.emulate = True
@@ -110,3 +110,5 @@ class QuarkW4A4MXFP4(QuarkScheme):
             return F.linear(x, dq_w, bias)
         else:
             raise NotImplementedError()
+    def process_weights_after_loading(self, layer) -> None:
+        pass

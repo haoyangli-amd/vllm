@@ -100,8 +100,10 @@ def _quant_dequant_mxfp4(x: torch.Tensor,
         raise ImportError("The package `amd-quark` is required to use "
                           "MX-FP4 models. Please install it with `pip install "
                           "amd-quark`.") from err
+    # return mx.qdq_mxfp4(x, scale_calculation_mode)
+    A, scale = _quant_dequant_mxfp4_fp6_fp8(x, dtype_str="fp4")
 
-    return mx.qdq_mxfp4(x, scale_calculation_mode)
+    return A
 
 
 def _quant_dequant_mxfp4_fake(x: torch.Tensor,
@@ -131,3 +133,52 @@ try:
     quant_dequant_mxfp4 = torch.ops.vllm.quant_dequant_mxfp4
 except AttributeError as error:
     raise error
+
+def _quant_dequant_mxfp4_fp6_fp8(x: torch.Tensor,
+                         scale_calculation_mode: str = "even", dtype_str: str="fp8_e4m3") -> torch.Tensor:
+    try:
+        from quark.torch.quantization.utils import (
+            calculate_qmin_qmax,
+            even_round,
+            get_dtype_params,
+            reshape_to_blocks,)
+        from quark.torch.quantization.config.type import Dtype
+        import quark
+    except ImportError as err:
+        raise ImportError("The package `amd-quark` is required to use "
+                          "MX-FP4 models. Please install it with `pip install "
+                          "amd-quark`.") from err
+
+    block_x = reshape_to_blocks(x, block_size=32, axis=-1)
+    amax, _ = torch.max(torch.abs(block_x), dim=-1, keepdim=True)
+    amax = amax.squeeze(-1)
+    if dtype_str == "fp8_e4m3":
+        dtype = Dtype.fp8_e4m3
+        quant_min = -448
+        quant_max = 448
+    elif dtype_str == "fp6_e2m3":
+        dtype = Dtype.fp6_e2m3
+        quant_min = -7.5
+        quant_max = 7.5
+    elif dtype_str == "fp4":
+        dtype = Dtype.fp4
+        quant_min = -6.0
+        quant_max = 6.0
+        
+    scale = even_round(amax, dtype)
+    zero_point = torch.zeros_like(scale)
+
+    x = quark.torch.kernel.scaled_fake_quantize(  # type: ignore[attr-defined]
+            dtype.value,
+            x,
+            scale,
+            zero_point.to(torch.int),
+            -1, #axis
+            32, # group_size
+            quant_min, # quant_min
+            quant_max, # quant_max
+            8, # round_mode
+            "per_group", # qscheme
+            "None", # mx_element_dtype
+            )
+    return x, None

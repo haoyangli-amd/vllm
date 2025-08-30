@@ -1040,14 +1040,15 @@ def inplace_fused_experts(
         a2_scale: Optional[torch.Tensor] = None,
         block_shape: Optional[List[int]] = None,  #noqa: UP006
         w1_bias: Optional[torch.Tensor] = None,
-        w2_bias: Optional[torch.Tensor] = None) -> None:
+        w2_bias: Optional[torch.Tensor] = None,
+        quark_act_dtype: Optional[str] = None) -> None:
     fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids, True,
                        activation, is_act_and_mul,
                        apply_router_weight_on_input, use_fp8_w8a8,
                        use_int8_w8a8, use_int8_w8a16, use_int4_w4a16,
                        use_mxfp4_w4a4, per_channel_quant, global_num_experts,
                        expert_map, w1_scale, w2_scale, w1_zp, w2_zp, a1_scale,
-                       a2_scale, block_shape, w1_bias, w2_bias)
+                       a2_scale, block_shape, w1_bias, w2_bias, quark_act_dtype)
 
 
 def inplace_fused_experts_fake(hidden_states: torch.Tensor,
@@ -1380,7 +1381,8 @@ def fused_experts(hidden_states: torch.Tensor,
                   allow_deep_gemm: bool = False,
                   allow_cutlass_block_scaled_grouped_gemm: bool = False,
                   w1_bias: Optional[torch.Tensor] = None,
-                  w2_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+                  w2_bias: Optional[torch.Tensor] = None,
+                  quark_act_dtype: Optional[str] = None) -> torch.Tensor:
     # For now, disable DeepGemm for small N (<= 512) until better
     # permute/unpermute ops are available.
     # However, on B200, we use DeepGemm for all cases because they only support
@@ -1448,6 +1450,7 @@ def fused_experts(hidden_states: torch.Tensor,
             block_shape=block_shape,
             w1_bias=w1_bias,
             w2_bias=w2_bias,
+            quark_act_dtype=quark_act_dtype
         )
 
 
@@ -1478,211 +1481,298 @@ def fused_experts_impl(
     block_shape: Optional[list[int]] = None,
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
+    quark_act_dtype: Optional[str] = None,
 ) -> torch.Tensor:
-    # Check constraints.
-    if use_int4_w4a16:
-        assert hidden_states.size(1) // 2 == w1.size(2), (
-            "Hidden size mismatch")
-    elif use_mxfp4_w4a4:
-        # 16bit activation and fp4x2 packed weight
-        assert hidden_states.size(1) // 2 == w1.size(2), "hidden size mismatch"
-    else:
-        assert hidden_states.size(1) == w1.size(2), (
-            f"Hidden size mismatch {hidden_states.size(1)} != {w1.size(2)}")
+    if 1: # oss qwqa
+        E, N, _ = w1.size()
+        w1 = dequant_mxfp4(w1, w1_scale, hidden_states.dtype)
+        w2 = dequant_mxfp4(w2, w2_scale, hidden_states.dtype)
+        if inplace:
+            out_hidden_states = hidden_states
+        else:
+            out_hidden_states = torch.empty_like(hidden_states)
+        # hidden_states # [16384, 2880]
+        # topk_weights # [16384, 4]
+        # topk_ids # [16384, 4]
+        # w1 # [32, 5760, 2880] # [32, out, inp]
+        # w2 # [32, 2880, 2880] # [32, out, inp]
+        qtype = quark_act_dtype
+        qout_hidden_states, a1q_scale = moe_kernel_quantize_input(
+                A=out_hidden_states,
+                A_scale=None,
+                quant_dtype=qtype,
+                per_act_token_quant=False,
+                block_shape=None)
 
-    assert topk_weights.size() == topk_ids.size(), "topk shape mismatch"
-    assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
-    assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
-    assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
-    assert hidden_states.dtype in [
-        torch.float32, torch.float16, torch.bfloat16
-    ]
-
-    num_tokens = hidden_states.size(0)
-    E, N, _ = w1.size()
-    K = w2.size(1)
-    if global_num_experts == -1:
-        global_num_experts = E
-    top_k_num = topk_ids.size(1)
-    # We execute the fused_moe kernel in chunks to circumvent this issue:
-    # https://github.com/vllm-project/vllm/issues/5938
-    CHUNK_SIZE = envs.VLLM_FUSED_MOE_CHUNK_SIZE
-    M = min(num_tokens, CHUNK_SIZE)
-    config_dtype = get_config_dtype_str(use_fp8_w8a8=use_fp8_w8a8,
-                                        use_int8_w8a16=use_int8_w8a16,
-                                        use_int4_w4a16=use_int4_w4a16,
-                                        use_mxfp4_w4a4=use_mxfp4_w4a4,
-                                        dtype=hidden_states.dtype)
-
-    qtype = get_config_quant_dtype(use_fp8_w8a8=use_fp8_w8a8,
-                                   use_int8_w8a8=use_int8_w8a8,
-                                   use_int8_w8a16=use_int8_w8a16,
-                                   use_int4_w4a16=use_int4_w4a16,
-                                   use_mxfp4_w4a4=use_mxfp4_w4a4)
-
-    get_config_func = functools.partial(
-        try_get_optimal_moe_config,
-        w1.size(),
-        w2.size(),
-        top_k_num,
-        config_dtype,
-        block_shape=block_shape,
-    )
-
-    config = get_config_func(M)
-
-    # We can reuse the memory between these because by the time we need
-    # cache3, we're done with cache1
-    cache13 = torch.empty(M * top_k_num * max(N, K),
-                          device=hidden_states.device,
-                          dtype=hidden_states.dtype)
-    intermediate_cache1 = cache13[:M * top_k_num * N].view(M, top_k_num, N)
-    intermediate_cache3 = cache13[:M * top_k_num * K].view(M, top_k_num, K)
-
-    # This needs separate memory since it's used concurrently with cache1
-    intermediate_cache2 = torch.empty((M * top_k_num, N // 2),
-                                      device=hidden_states.device,
-                                      dtype=hidden_states.dtype)
-
-    if hidden_states.dtype == torch.bfloat16:
-        compute_type = tl.bfloat16
-    elif hidden_states.dtype == torch.float16:
-        compute_type = tl.float16
-    elif hidden_states.dtype == torch.float32:
-        compute_type = tl.float32
-    else:
-        raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
-
-    if inplace:
-        out_hidden_states = hidden_states
-    else:
-        out_hidden_states = torch.empty_like(hidden_states)
-
-    if use_mxfp4_w4a4:
-        # Weight has to be dequantized for mxfp4 emulation.
+        expanded = qout_hidden_states.repeat(E, 1) # [32， 16384, 2880]
+        expanded = expanded.view(E, -1, 2880) # [32， 16384, 2880]
+        # [32, 16384, 2880] * [32, 5760, 2880] + [5760] = [32, 16384, 5760]
+        w1 = w1.transpose(-2, -1)  # [32, 5760, 2880]-> # [32, 2880, 5760] # 转置前是按照linear weight的格式[32, out,inp]
+        w2 = w2.transpose(-2, -1)# [32, 2880, 2880]-> # [32, 2880, 2880]# 转置前是按照linear weight的格式[32, out,inp],之后是符合bmm格式[m,n]*[n,k]
+        gate_up = torch.bmm(expanded, w1) + w1_bias[..., None, :] 
+        gate = gate_up[:,:,:2880]
+        up = gate_up[:,:,2880:]
+        gate = gate.clamp(min=None, max=7.0) # [32, 16384, 2880]
+        up = up.clamp(min=-7.0, max=7.0) # [32, 16384, 2880]
+        glu = gate * torch.sigmoid(gate * 1.702) # [32, 16384, 2880]
+        act_after_glu = (up + 1) * glu
+        qact_after_glu, a2q_scale = moe_kernel_quantize_input(
+                A=act_after_glu,
+                A_scale=None,
+                quant_dtype=qtype,
+                per_act_token_quant=False,
+                block_shape=None)
+        next_states = torch.bmm(qact_after_glu, w2) # [32, 16384, 2880] * [32, 2880, 2880] # need transpose？
+        next_states = next_states + w2_bias[..., None, :] # [32, 16384, 2880] + [32, 1 ,2880]
+        full_weights = torch.zeros(topk_weights.shape[0], E, device=topk_weights.device)
+        full_weights.scatter_(1, topk_ids.long(), topk_weights) # # [16384, 32]
+        # [32, 16384, 2880] * 
+        # [16384, 32]->[32, 16384]->[32, 16484, 1]
+        next_states = next_states * full_weights.transpose(0, 1).unsqueeze(-1)
+        final = next_states.sum(dim=0).to(hidden_states.dtype) # [32, 16384, 2880]
+        out_hidden_states.copy_(final)
+        return out_hidden_states
+    elif 0: # for gptoss weight only
         w1 = dequant_mxfp4(w1, w1_scale, hidden_states.dtype)
         w1_scale = None
         w2 = dequant_mxfp4(w2, w2_scale, hidden_states.dtype)
         w2_scale = None
-
-    for chunk in range((num_tokens // CHUNK_SIZE) + 1):
-        begin_chunk_idx, end_chunk_idx = (chunk * CHUNK_SIZE,
-                                          min((chunk + 1) * CHUNK_SIZE,
-                                              num_tokens))
-        curr_hidden_states = hidden_states[begin_chunk_idx:end_chunk_idx]
-        tokens_in_chunk, _ = curr_hidden_states.size()
-
-        if tokens_in_chunk == 0:
-            break
-
-        if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
-            # Adjust the intermediate cache size and config for the last
-            # chunk. Note that in most cases we only have one chunk
-            # so the cache size and config are already set correctly and
-            # do not need to be adjusted.
-            intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
-            intermediate_cache2 = intermediate_cache2[:tokens_in_chunk *
-                                                      topk_ids.size(1)]
-            intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
-            config = get_config_func(tokens_in_chunk)
-
-        curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
-        curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
-        qcurr_hidden_states, a1q_scale = moe_kernel_quantize_input(
-            A=curr_hidden_states,
-            A_scale=a1_scale,
-            quant_dtype=qtype,
-            per_act_token_quant=per_channel_quant,
-            block_shape=block_shape)
-
-        sorted_token_ids, expert_ids, num_tokens_post_padded = (
-            moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'],
-                                 global_num_experts, expert_map))
-
-        invoke_fused_moe_kernel(qcurr_hidden_states,
-                                w1,
-                                intermediate_cache1,
-                                a1q_scale,
-                                w1_scale,
-                                w1_zp,
-                                curr_topk_weights,
-                                sorted_token_ids,
-                                expert_ids,
-                                num_tokens_post_padded,
-                                apply_router_weight_on_input,
-                                top_k_num,
-                                config,
-                                compute_type=compute_type,
-                                use_fp8_w8a8=use_fp8_w8a8,
-                                use_int8_w8a8=use_int8_w8a8,
-                                use_int8_w8a16=use_int8_w8a16,
-                                use_int4_w4a16=use_int4_w4a16,
-                                per_channel_quant=per_channel_quant,
-                                block_shape=block_shape,
-                                B_bias=w1_bias)
-
-        # TODO fused kernel
-        def swiglu_oai(gate_up):
-            alpha = 1.702
-            limit = 7.0
-            gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-            gate = gate.clamp(min=None, max=limit)
-            up = up.clamp(min=-limit, max=limit)
-            glu = gate * torch.sigmoid(gate * alpha)
-            gated_output = (up + 1) * glu
-            return gated_output
-
-        # Activation function with multiplication
-        if activation == "silu" and is_act_and_mul:
-            torch.ops._C.silu_and_mul(intermediate_cache2,
-                                      intermediate_cache1.view(-1, N))
-        elif activation == "gelu" and is_act_and_mul:
-            torch.ops._C.gelu_and_mul(intermediate_cache2,
-                                      intermediate_cache1.view(-1, N))
-        # Activation function without multiplication
-        elif activation == "silu":
-            intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
-        elif activation == "gelu":
-            intermediate_cache2 = F.gelu(intermediate_cache1.view(-1, N))
-        elif activation == "swiglu_oai":
-            intermediate_cache2 = swiglu_oai(intermediate_cache1.view(-1, N))
+        if inplace:
+            out_hidden_states = hidden_states
         else:
-            raise ValueError(f"Unsupported FusedMoe activation: {activation}, "
-                             f"with is_act_and_mul={is_act_and_mul}.")
+            out_hidden_states = torch.empty_like(hidden_states)
+        # hidden_states # [16384, 2880]
+        # topk_weights # [16384, 4]
+        # topk_ids # [16384, 4]
+        # w1 # [32, 5760, 2880] # [32, out, inp]
+        # w2 # [32, 2880, 2880] # [32, out, inp]
 
-        qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
-            A=intermediate_cache2,
-            A_scale=a2_scale,
-            quant_dtype=qtype,
-            per_act_token_quant=per_channel_quant,
-            block_shape=block_shape)
+        expanded = out_hidden_states.repeat(32, 1) # [32， 16384, 2880]
+        expanded = expanded.view(32, -1, 2880) # [32， 16384, 2880]
+        # [32, 16384, 2880] * [32, 5760, 2880] + [5760] = [32, 16384, 5760]
+        w1 = w1.transpose(-2, -1)  # [32, 5760, 2880]-> # [32, 2880, 5760] # 转置前是按照linear weight的格式[32, out,inp]
+        w2 = w2.transpose(-2, -1)# [32, 2880, 2880]-> # [32, 2880, 2880]# 转置前是按照linear weight的格式[32, out,inp],之后是符合bmm格式[m,n]*[n,k]
+        gate_up = torch.bmm(expanded, w1) + w1_bias[..., None, :] 
+        gate = gate_up[:,:,:2880]
+        up = gate_up[:,:,2880:]
+        gate = gate.clamp(min=None, max=7.0) # [32, 16384, 2880]
+        up = up.clamp(min=-7.0, max=7.0) # [32, 16384, 2880]
+        glu = gate * torch.sigmoid(gate * 1.702) # [32, 16384, 2880]
+        next_states = torch.bmm(((up + 1) * glu), w2) # [32, 16384, 2880] * [32, 2880, 2880] # need transpose？
+        next_states = next_states + w2_bias[..., None, :] # [32, 16384, 2880] + [32, 1 ,2880]
+        full_weights = torch.zeros(topk_weights.shape[0], 32, device=topk_weights.device)
+        full_weights.scatter_(1, topk_ids.long(), topk_weights) # # [16384, 32]
+        # [32, 16384, 2880] * 
+        # [16384, 32]->[32, 16384]->[32, 16484, 1]
+        next_states = next_states * full_weights.transpose(0, 1).unsqueeze(-1)
+        final = next_states.sum(dim=0).to(hidden_states.dtype) # [32, 16384, 2880]
+        out_hidden_states.copy_(final)
+        return out_hidden_states
+    else:
+        # Check constraints.
+        if use_int4_w4a16:
+            assert hidden_states.size(1) // 2 == w1.size(2), (
+                "Hidden size mismatch")
+        elif use_mxfp4_w4a4:
+            # 16bit activation and fp4x2 packed weight
+            assert hidden_states.size(1) // 2 == w1.size(2), "hidden size mismatch"
+        else:
+            assert hidden_states.size(1) == w1.size(2), (
+                f"Hidden size mismatch {hidden_states.size(1)} != {w1.size(2)}")
 
-        invoke_fused_moe_kernel(qintermediate_cache2,
-                                w2,
-                                intermediate_cache3,
-                                a2q_scale,
-                                w2_scale,
-                                w2_zp,
-                                curr_topk_weights,
-                                sorted_token_ids,
-                                expert_ids,
-                                num_tokens_post_padded,
-                                not apply_router_weight_on_input,
-                                1,
-                                config,
-                                compute_type=compute_type,
-                                use_fp8_w8a8=use_fp8_w8a8,
-                                use_int8_w8a8=use_int8_w8a8,
-                                use_int8_w8a16=use_int8_w8a16,
-                                use_int4_w4a16=use_int4_w4a16,
-                                per_channel_quant=per_channel_quant,
-                                block_shape=block_shape,
-                                B_bias=w2_bias)
+        assert topk_weights.size() == topk_ids.size(), "topk shape mismatch"
+        assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
+        assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
+        assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
+        assert hidden_states.dtype in [
+            torch.float32, torch.float16, torch.bfloat16
+        ]
 
-        ops.moe_sum(intermediate_cache3.view(*intermediate_cache3.size()),
-                    out_hidden_states[begin_chunk_idx:end_chunk_idx])
+        num_tokens = hidden_states.size(0)
+        E, N, _ = w1.size()
+        K = w2.size(1)
+        if global_num_experts == -1:
+            global_num_experts = E
+        top_k_num = topk_ids.size(1)
+        # We execute the fused_moe kernel in chunks to circumvent this issue:
+        # https://github.com/vllm-project/vllm/issues/5938
+        CHUNK_SIZE = envs.VLLM_FUSED_MOE_CHUNK_SIZE
+        M = min(num_tokens, CHUNK_SIZE)
+        config_dtype = get_config_dtype_str(use_fp8_w8a8=use_fp8_w8a8,
+                                            use_int8_w8a16=use_int8_w8a16,
+                                            use_int4_w4a16=use_int4_w4a16,
+                                            use_mxfp4_w4a4=use_mxfp4_w4a4,
+                                            dtype=hidden_states.dtype)
 
-    return out_hidden_states
+        qtype = get_config_quant_dtype(use_fp8_w8a8=use_fp8_w8a8,
+                                    use_int8_w8a8=use_int8_w8a8,
+                                    use_int8_w8a16=use_int8_w8a16,
+                                    use_int4_w4a16=use_int4_w4a16,
+                                    use_mxfp4_w4a4=use_mxfp4_w4a4)
+
+        get_config_func = functools.partial(
+            try_get_optimal_moe_config,
+            w1.size(),
+            w2.size(),
+            top_k_num,
+            config_dtype,
+            block_shape=block_shape,
+        )
+
+        config = get_config_func(M)
+
+        # We can reuse the memory between these because by the time we need
+        # cache3, we're done with cache1
+        cache13 = torch.empty(M * top_k_num * max(N, K),
+                            device=hidden_states.device,
+                            dtype=hidden_states.dtype)
+        intermediate_cache1 = cache13[:M * top_k_num * N].view(M, top_k_num, N)
+        intermediate_cache3 = cache13[:M * top_k_num * K].view(M, top_k_num, K)
+
+        # This needs separate memory since it's used concurrently with cache1
+        intermediate_cache2 = torch.empty((M * top_k_num, N // 2),
+                                        device=hidden_states.device,
+                                        dtype=hidden_states.dtype)
+
+        if hidden_states.dtype == torch.bfloat16:
+            compute_type = tl.bfloat16
+        elif hidden_states.dtype == torch.float16:
+            compute_type = tl.float16
+        elif hidden_states.dtype == torch.float32:
+            compute_type = tl.float32
+        else:
+            raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
+
+        if inplace:
+            out_hidden_states = hidden_states
+        else:
+            out_hidden_states = torch.empty_like(hidden_states)
+
+        if use_mxfp4_w4a4:
+            # Weight has to be dequantized for mxfp4 emulation.
+            w1 = dequant_mxfp4(w1, w1_scale, hidden_states.dtype)
+            w1_scale = None
+            w2 = dequant_mxfp4(w2, w2_scale, hidden_states.dtype)
+            w2_scale = None
+
+        for chunk in range((num_tokens // CHUNK_SIZE) + 1):
+            begin_chunk_idx, end_chunk_idx = (chunk * CHUNK_SIZE,
+                                            min((chunk + 1) * CHUNK_SIZE,
+                                                num_tokens))
+            curr_hidden_states = hidden_states[begin_chunk_idx:end_chunk_idx]
+            tokens_in_chunk, _ = curr_hidden_states.size()
+
+            if tokens_in_chunk == 0:
+                break
+
+            if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
+                # Adjust the intermediate cache size and config for the last
+                # chunk. Note that in most cases we only have one chunk
+                # so the cache size and config are already set correctly and
+                # do not need to be adjusted.
+                intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
+                intermediate_cache2 = intermediate_cache2[:tokens_in_chunk *
+                                                        topk_ids.size(1)]
+                intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
+                config = get_config_func(tokens_in_chunk)
+
+            curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
+            curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
+            qcurr_hidden_states, a1q_scale = moe_kernel_quantize_input(
+                A=curr_hidden_states,
+                A_scale=a1_scale,
+                quant_dtype=qtype,
+                per_act_token_quant=per_channel_quant,
+                block_shape=block_shape)
+
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'],
+                                    global_num_experts, expert_map))
+
+            invoke_fused_moe_kernel(qcurr_hidden_states,
+                                    w1,
+                                    intermediate_cache1,
+                                    a1q_scale,
+                                    w1_scale,
+                                    w1_zp,
+                                    curr_topk_weights,
+                                    sorted_token_ids,
+                                    expert_ids,
+                                    num_tokens_post_padded,
+                                    apply_router_weight_on_input,
+                                    top_k_num,
+                                    config,
+                                    compute_type=compute_type,
+                                    use_fp8_w8a8=use_fp8_w8a8,
+                                    use_int8_w8a8=use_int8_w8a8,
+                                    use_int8_w8a16=use_int8_w8a16,
+                                    use_int4_w4a16=use_int4_w4a16,
+                                    per_channel_quant=per_channel_quant,
+                                    block_shape=block_shape,
+                                    B_bias=w1_bias)
+
+            # TODO fused kernel
+            def swiglu_oai(gate_up):
+                alpha = 1.702
+                limit = 7.0
+                gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+                gate = gate.clamp(min=None, max=limit)
+                up = up.clamp(min=-limit, max=limit)
+                glu = gate * torch.sigmoid(gate * alpha)
+                gated_output = (up + 1) * glu
+                return gated_output
+
+            # Activation function with multiplication
+            if activation == "silu" and is_act_and_mul:
+                torch.ops._C.silu_and_mul(intermediate_cache2,
+                                        intermediate_cache1.view(-1, N))
+            elif activation == "gelu" and is_act_and_mul:
+                torch.ops._C.gelu_and_mul(intermediate_cache2,
+                                        intermediate_cache1.view(-1, N))
+            # Activation function without multiplication
+            elif activation == "silu":
+                intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
+            elif activation == "gelu":
+                intermediate_cache2 = F.gelu(intermediate_cache1.view(-1, N))
+            elif activation == "swiglu_oai":
+                intermediate_cache2 = swiglu_oai(intermediate_cache1.view(-1, N))
+            else:
+                raise ValueError(f"Unsupported FusedMoe activation: {activation}, "
+                                f"with is_act_and_mul={is_act_and_mul}.")
+
+            qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+                A=intermediate_cache2,
+                A_scale=a2_scale,
+                quant_dtype=qtype,
+                per_act_token_quant=per_channel_quant,
+                block_shape=block_shape)
+
+            invoke_fused_moe_kernel(qintermediate_cache2,
+                                    w2,
+                                    intermediate_cache3,
+                                    a2q_scale,
+                                    w2_scale,
+                                    w2_zp,
+                                    curr_topk_weights,
+                                    sorted_token_ids,
+                                    expert_ids,
+                                    num_tokens_post_padded,
+                                    not apply_router_weight_on_input,
+                                    1,
+                                    config,
+                                    compute_type=compute_type,
+                                    use_fp8_w8a8=use_fp8_w8a8,
+                                    use_int8_w8a8=use_int8_w8a8,
+                                    use_int8_w8a16=use_int8_w8a16,
+                                    use_int4_w4a16=use_int4_w4a16,
+                                    per_channel_quant=per_channel_quant,
+                                    block_shape=block_shape,
+                                    B_bias=w2_bias)
+
+            ops.moe_sum(intermediate_cache3.view(*intermediate_cache3.size()),
+                        out_hidden_states[begin_chunk_idx:end_chunk_idx])
+
+        return out_hidden_states
 
 
 def fused_moe(
