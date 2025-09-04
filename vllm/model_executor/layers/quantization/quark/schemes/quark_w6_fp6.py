@@ -5,21 +5,23 @@ from typing import Any, Callable, Optional
 
 import torch
 import torch.nn.functional as F
+from torch.nn import Parameter
 
+from vllm.model_executor.layers.quantization.utils.int4_utils import dequant_quark_weight
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.quark.schemes import QuarkScheme
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
-    OCP_MX_BLOCK_SIZE, dequant_mxfp4, quant_dequant_mxfp4fp6fp8)
+    OCP_MX_BLOCK_SIZE, quant_dequant_mxfp4fp6fp8)
 from vllm.model_executor.parameter import (GroupQuantScaleParameter,
                                            PackedvLLMParameter)
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-__all__ = ["QuarkW4MXFP4"]
+__all__ = ["QuarkW6MXFP6"]
 
 
-class QuarkW4MXFP4(QuarkScheme):
+class QuarkW6MXFP6(QuarkScheme):
 
     def __init__(self, weight_quant_spec: dict[str, Any],
                  input_quant_spec: dict[str, Any]):
@@ -30,23 +32,16 @@ class QuarkW4MXFP4(QuarkScheme):
         self.inp_dtype = None
         if self.input_quant_spec is not None:
             self.inp_dtype = self.input_quant_spec.get("dtype")
+        self._custom_mode = "quark"
+        self.w_qscheme = self.weight_quant_spec.get("qscheme")
+        self.w_dtype= self.weight_quant_spec.get("dtype")
+        self.w_group_size = self.weight_quant_spec.get("group_size")
+        self.w_ch_axis = self.weight_quant_spec.get("ch_axis")
+        self.reorder = True
+        from quark.torch.utils.pack import create_pack_method
+        self.pack_method = create_pack_method(qscheme=self.w_qscheme, dtype=self.w_dtype)   
 
 
-        if not current_platform.supports_mx():
-            self.emulate = True
-            logger.warning_once(
-                "The current platform does not support native MXFP4 "
-                "computation. Simulated weight dequantization and activation "
-                "QDQ (quantize and dequantize) will be used, with the linear "
-                "layers computed in high precision.")
-        else:
-            self.emulate = True
-            logger.warning_once(
-                "The current platform supports native MXFP4 "
-                "computation, but kernels are not yet integrated in vLLM. "
-                "Simulated weight dequantization and activation "
-                "QDQ (quantize and dequantize) will be used, with the linear "
-                "layers computed in high precision.")
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -57,6 +52,27 @@ class QuarkW4MXFP4(QuarkScheme):
                                           requires_grad=False)
         layer.weight_scale = torch.nn.Parameter(layer.weight_scale.data,
                                                 requires_grad=False)
+
+        weight = self.pack_method.unpack(
+            layer.weight, # [2880, 640]
+            self.reorder,
+            **({"origin_packed_axis_size": layer.weight_scale.shape[-1]} if layer.weight_scale.shape != torch.Size([]) else {}),
+            )
+        weight_zero_point = None
+        # weight_scale = layer.weight_scale.data.t().contiguous() # only u-int8, u-int4, int2 are transposed when per_group
+        float_dtype = torch.float32 # mx scale_format is e8m0, we should convert it to float32, mxf4 process this by hip kernel
+        weight_scale = 2 ** (layer.weight_scale.view(torch.uint8).to(torch.int16) - 127).to(float_dtype)
+        dq_w = dequant_quark_weight(
+            self.w_dtype,
+            weight, # qkv[5120,2880]
+            weight_scale, # [5120,90]
+            weight_zero_point, # [5120, 90]
+            self.w_ch_axis, # 1
+            self.w_group_size, # 32
+            self.w_qscheme,  #str
+        )
+        float_weight = Parameter(dq_w, requires_grad=False)
+        layer.register_parameter("float_weight", float_weight)
 
     def create_weights(self, layer: torch.nn.Module,
                        output_partition_sizes: list[int],
@@ -69,8 +85,8 @@ class QuarkW4MXFP4(QuarkScheme):
         # WEIGHT
         weight = PackedvLLMParameter(
             data=torch.empty(
-                output_size_per_partition,
-                input_size_per_partition // 2,
+                output_size_per_partition, # 4096
+                input_size_per_partition // 4 * 3, # 2880 / 4 * 3 = 2160
                 dtype=torch.uint8,
             ),
             input_dim=1,
@@ -84,8 +100,8 @@ class QuarkW4MXFP4(QuarkScheme):
         # WEIGHT SCALE
         weight_scale = GroupQuantScaleParameter(
             data=torch.empty(
-                output_size_per_partition,
-                input_size_per_partition // OCP_MX_BLOCK_SIZE,
+                output_size_per_partition, # 4096
+                input_size_per_partition // OCP_MX_BLOCK_SIZE, # 2880 // 32 = 90
                 dtype=torch.uint8,
             ),
             input_dim=1,
@@ -99,13 +115,7 @@ class QuarkW4MXFP4(QuarkScheme):
                       x: torch.Tensor,
                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
 
-        if self.emulate:
-            dq_w = dequant_mxfp4(layer.weight, layer.weight_scale, x.dtype)
-
-            x = quant_dequant_mxfp4fp6fp8(x, self.inp_dtype)
-
-            return F.linear(x, dq_w, bias)
-        else:
-            raise NotImplementedError()
-    def process_weights_after_loading(self, layer) -> None:
-        pass
+        assert hasattr(layer, "float_weight")
+        x = quant_dequant_mxfp4fp6fp8(x, self.inp_dtype)
+        dq_w = layer.float_weight.to(x.dtype)
+        return F.linear(x, dq_w, bias)

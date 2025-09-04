@@ -92,20 +92,21 @@ def _dequant_mxfp4_fake(x: torch.Tensor, scale: torch.Tensor,
                        device=x.device)
 
 
-def _quant_dequant_mxfp4(x: torch.Tensor,
-                         scale_calculation_mode: str = "even") -> torch.Tensor:
+def _quant_dequant_mxfp4fp6fp8(x: torch.Tensor,
+                               inp_dtype: str = "fp4") -> torch.Tensor:
     try:
         from quark.torch.kernel import mx
     except ImportError as err:
         raise ImportError("The package `amd-quark` is required to use "
                           "MX-FP4 models. Please install it with `pip install "
                           "amd-quark`.") from err
+    A = _quant_dequant_mxfp4_fp6_fp8(x, inp_dtype=inp_dtype)
 
-    return mx.qdq_mxfp4(x, scale_calculation_mode)
+    return A
 
 
-def _quant_dequant_mxfp4_fake(x: torch.Tensor,
-                              scale_calculation_mode: str = "even"
+def _quant_dequant_mxfp4fp6fp8_fake(x: torch.Tensor,
+                              inp_dtype: str = "fp4"
                               ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -123,11 +124,52 @@ except AttributeError as error:
 
 try:
     direct_register_custom_op(
-        op_name="quant_dequant_mxfp4",
-        op_func=_quant_dequant_mxfp4,
+        op_name="quant_dequant_mxfp4fp6fp8",
+        op_func=_quant_dequant_mxfp4fp6fp8,
         mutates_args=[],
-        fake_impl=_quant_dequant_mxfp4_fake,
+        fake_impl=_quant_dequant_mxfp4fp6fp8_fake,
     )
-    quant_dequant_mxfp4 = torch.ops.vllm.quant_dequant_mxfp4
+    quant_dequant_mxfp4fp6fp8 = torch.ops.vllm.quant_dequant_mxfp4fp6fp8
 except AttributeError as error:
     raise error
+
+def _quant_dequant_mxfp4_fp6_fp8(x: torch.Tensor,
+                                 inp_dtype: str="fp4") -> torch.Tensor:
+
+    from quark.torch.quantization.utils import reshape_to_blocks
+    from quark.torch.quantization.config.type import Dtype
+    from quark.torch.quantization.utils import even_round
+    import quark
+    block_x = reshape_to_blocks(x, block_size=32, axis=-1)
+    amax, _ = torch.max(torch.abs(block_x), dim=-1, keepdim=True)
+    amax = amax.squeeze(-1)
+    if inp_dtype == "fp8_e4m3":
+        dtype = Dtype.fp8_e4m3
+        quant_min = -448
+        quant_max = 448
+    elif inp_dtype == "fp6_e2m3":
+        dtype = Dtype.fp6_e2m3
+        quant_min = -7.5
+        quant_max = 7.5
+    elif inp_dtype == "fp4":
+        dtype = Dtype.fp4
+        quant_min = -6.0
+        quant_max = 6.0
+        
+    scale = even_round(amax, dtype)
+    zero_point = torch.zeros_like(scale)
+
+    x = quark.torch.kernel.scaled_fake_quantize(  # type: ignore[attr-defined]
+            dtype.value,
+            x,
+            scale,
+            zero_point.to(torch.int),
+            -1, #axis
+            32, # group_size
+            quant_min, # quant_min
+            quant_max, # quant_max
+            8, # round_mode
+            "per_group", # qscheme
+            "None", # mx_element_dtype
+            )
+    return x

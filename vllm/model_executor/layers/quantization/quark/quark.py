@@ -10,6 +10,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
                                                UnquantizedLinearMethod)
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (  # noqa: E501
     QuantizationConfig, QuantizeMethodBase)
@@ -17,9 +18,26 @@ from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.quark.quark_moe import (  # noqa: E501
     QuarkMoEMethod)
 from vllm.model_executor.layers.quantization.quark.schemes import (
-    QuarkScheme, QuarkW4A4MXFP4, QuarkW8A8Fp8, QuarkW8A8Int8)
+    QuarkScheme, QuarkW4MXFP4, QuarkW8A8Fp8, QuarkW8A8Int8, QuarkW4Int4, QuarkW6MXFP6)
 from vllm.model_executor.layers.quantization.quark.utils import (
     deep_compare, should_ignore_layer)
+from vllm.platforms import current_platform
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
+import torch.nn.functional as F
+from torch.nn.parameter import Parameter, UninitializedParameter
+
+from vllm.distributed import (divide, get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size,
+                              tensor_model_parallel_all_reduce)
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig, QuantizeMethodBase, method_has_implemented_embedding)
+from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+from vllm.model_executor.parameter import BasevLLMParameter
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 __all__ = ["QuarkLinearMethod"]
@@ -41,6 +59,7 @@ class QuarkConfig(QuantizationConfig):
         self.kv_cache_group = kv_cache_group
         self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
+        self.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
 
     def get_linear_method(self) -> "QuarkLinearMethod":
         return QuarkLinearMethod(self)
@@ -76,6 +95,16 @@ class QuarkConfig(QuantizationConfig):
             return QuarkMoEMethod.get_moe_method(self,
                                                  module=layer,
                                                  layer_name=prefix)
+        if isinstance(layer, VocabParallelEmbedding):
+            quantized_lm_head = True # just for int4
+            for layer in exclude_layers:
+                if "lm_head" in layer:
+                    quantized_lm_head = False
+                    break
+            if quantized_lm_head:
+                return QuarkLmheadMethod(self,
+                                        module=layer,
+                                        layer_name=prefix)
         return None
 
     @classmethod
@@ -188,6 +217,36 @@ class QuarkConfig(QuantizationConfig):
         is_per_tensor_activation = (input_quant.get("qscheme") == "per_tensor")
         return is_per_tensor_activation
 
+    def _is_int4(self, weight_quant: Optional[dict[str, Any]],
+                     input_quant: Optional[dict[str, Any]]) -> bool:
+        # Confirm weights and input quantized.
+        if weight_quant is None:
+            return False
+
+        # Input and weight dtype needs to be fp4.
+        if weight_quant.get("dtype") != "int4":
+            # logger.debug("Quark model is not in MX-FP4 format: dtype not fp4")
+            return False
+
+        # Input and weight qscheme needs to be per group.
+        if weight_quant.get("qscheme") != "per_group":
+            # logger.debug("Quark model is not in MX-FP4 format: not per_group")
+            return False
+
+        # Input and weight group size needs to be 32.
+        if weight_quant.get("group_size") != 32:
+            logger.debug(
+                "Quark model is not in int4 format: not group_size=32")
+            return False
+
+        # Activations need to use dynamic quantization.
+        if input_quant is not None and input_quant.get("is_dynamic") is False:
+            # logger.debug(
+                # "Quark model is not in MX-FP4 format: not activation dynamic")
+            return False
+
+        return True
+
     def _is_static_tensor_w8a8(self, weight_quant: Optional[dict[str, Any]],
                                input_quant: Optional[dict[str, Any]]) -> bool:
         # Confirm weights and input quantized.
@@ -213,44 +272,80 @@ class QuarkConfig(QuantizationConfig):
     def _is_mx_fp4(self, weight_quant: Optional[dict[str, Any]],
                    input_quant: Optional[dict[str, Any]]) -> bool:
         # Confirm weights and input quantized.
-        if weight_quant is None or input_quant is None:
+        if weight_quant is None:
             logger.debug("Quark model is not in MX-FP4 format: "
                          "weight_quant or input_quant not set")
             return False
 
         # Input and weight dtype needs to be fp4.
-        if weight_quant.get("dtype") != "fp4" or input_quant.get(
-                "dtype") != "fp4":
+        if weight_quant.get("dtype") != "fp4":
             logger.debug("Quark model is not in MX-FP4 format: dtype not fp4")
             return False
 
         # Input and weight qscheme needs to be per group.
-        if weight_quant.get("qscheme") != "per_group" or input_quant.get(
-                "qscheme") != "per_group":
+        if weight_quant.get("qscheme") != "per_group":
             logger.debug("Quark model is not in MX-FP4 format: not per_group")
             return False
 
         # Input and weight group size needs to be 32.
-        if weight_quant.get("group_size") != 32 or input_quant.get(
-                "group_size") != 32:
+        if weight_quant.get("group_size") != 32:
             logger.debug(
                 "Quark model is not in MX-FP4 format: not group_size=32")
             return False
 
         # Activations need to use dynamic quantization.
-        if input_quant.get("is_dynamic") is False:
+        if input_quant is not None and input_quant.get("is_dynamic") is False:
             logger.debug(
                 "Quark model is not in MX-FP4 format: not activation dynamic")
             return False
 
         # Activations and weight scales need to be in e8m0 format.
-        if weight_quant.get("scale_format") != "e8m0" or input_quant.get(
-                "scale_format") != "e8m0":
+        if weight_quant.get("scale_format") != "e8m0" or (input_quant is not None and input_quant.get(
+                "scale_format") != "e8m0"):
             logger.debug(
                 "Quark model is not in MX-FP4 format: not scale_format e8m0")
             return False
 
         return True
+    def _is_mx_fp6(self, weight_quant: Optional[dict[str, Any]],
+                   input_quant: Optional[dict[str, Any]]) -> bool:
+        # Confirm weights and input quantized.
+        if weight_quant is None:
+            logger.debug("Quark model is not in MX-FP6 format: "
+                         "weight_quant or input_quant not set")
+            return False
+
+        # Input and weight dtype needs to be fp4.
+        if weight_quant.get("dtype") != "fp6_e2m3":
+            logger.debug("Quark model is not in MX-FP6 format: dtype not fp4")
+            return False
+
+        # Input and weight qscheme needs to be per group.
+        if weight_quant.get("qscheme") != "per_group":
+            logger.debug("Quark model is not in MX-FP6 format: not per_group")
+            return False
+
+        # Input and weight group size needs to be 32.
+        if weight_quant.get("group_size") != 32:
+            logger.debug(
+                "Quark model is not in MX-FP6 format: not group_size=32")
+            return False
+
+        # Activations need to use dynamic quantization.
+        if input_quant is not None and input_quant.get("is_dynamic") is False:
+            logger.debug(
+                "Quark model is not in MX-FP6 format: not activation dynamic")
+            return False
+
+        # Activations and weight scales need to be in e8m0 format.
+        if weight_quant.get("scale_format") != "e8m0" or (input_quant is not None and input_quant.get(
+                "scale_format") != "e8m0"):
+            logger.debug(
+                "Quark model is not in MX-FP6 format: not scale_format e8m0")
+            return False
+
+        return True
+
 
     def _find_matched_config(self, layer_name: str,
                              module: torch.nn.Module) -> dict[str, Any]:
@@ -312,8 +407,12 @@ class QuarkConfig(QuantizationConfig):
             return QuarkW8A8Int8(qscheme=weight_qscheme,
                                  is_static_input_scheme=True,
                                  input_symmetric=input_config.get("symmetric"))
+        elif self._is_int4(weight_config, input_config):
+            return QuarkW4Int4(weight_config, input_config)
         elif self._is_mx_fp4(weight_config, input_config):
-            return QuarkW4A4MXFP4(weight_config, input_config)
+            return QuarkW4MXFP4(weight_config, input_config)
+        elif self._is_mx_fp6(weight_config, input_config):
+            return QuarkW6MXFP6(weight_config, input_config)
 
         raise NotImplementedError("No quark compatible scheme was found. "
                                   f"Weight config: {weight_config}, "
@@ -429,3 +528,137 @@ class QuarkKVCacheMethod(BaseKVCacheMethod):
                 "Only support per-tensor scaling factor "
                 "for quark KV cache. "
                 f"Expected qscheme: per_tensor, found qscheme: {qscheme}")
+
+
+
+class QuarkLmheadMethod(QuantizeMethodBase):
+    
+    def __init__(self, quant_config: "QuarkConfig",  # type: ignore # noqa E501 # noqa F821
+                module: torch.nn.Module,
+                layer_name: str):
+        layer_quant_config = quant_config._find_matched_config(layer_name, module)
+        self.weight_quant_spec = layer_quant_config.get("weight")
+        self._custom_mode = "quark"
+        self.w_qscheme = self.weight_quant_spec.get("qscheme")
+        self.w_dtype= self.weight_quant_spec.get("dtype")
+        self.w_group_size = self.weight_quant_spec.get("group_size")
+        self.w_ch_axis = self.weight_quant_spec.get("ch_axis")
+
+        # self.input_quant_spec = layer_quant_config.get("inputs")
+        # self.inp_dtype = None
+        # if self.input_quant_spec is not None:
+        #     self.inp_dtype = self.input_quant_spec.get("dtype")
+
+        from quark.torch.utils.pack import create_pack_method
+        self.pack_method = create_pack_method(qscheme=self.w_qscheme, dtype=self.w_dtype)  
+        self.reorder = True
+        # self.static_input_scales = not input_quant_spec.get("is_dynamic")
+        self.emulate=True
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 70
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.weight = torch.nn.Parameter(layer.weight.data,
+                                          requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(layer.weight_scale.data,
+                                                requires_grad=False)
+        weight = self.pack_method.unpack(
+            layer.weight,
+            self.reorder,
+            **({"origin_packed_axis_size": layer.weight_scale.shape[-1]} if layer.weight_scale.shape != torch.Size([]) else {}),
+            )  
+        weight_zero_point = self.pack_method.unpack(
+            layer.weight_zero_point,
+            self.reorder,
+            **({"origin_packed_axis_size": layer.weight_scale.shape[-1]} if layer.weight_scale.shape != torch.Size([]) else {}),
+        )
+        weight_scale = layer.weight_scale.data.t().contiguous()
+        import quark
+        dq_w = quark.torch.kernel.dequantize(  # type: ignore[attr-defined]
+                self.w_dtype,
+                weight,
+                weight_scale,
+                weight_zero_point,
+                self.w_ch_axis, # 1
+                self.w_group_size, # 32
+                self.w_qscheme
+            )
+        float_weight = Parameter(dq_w, requires_grad=False)
+        layer.register_parameter("float_weight", float_weight)
+                                                
+    '''
+    lm_head.weight: shape=torch.Size([2880, 25136]), dtype=torch.int32
+    lm_head.weight_zero_point: shape=torch.Size([90, 25136]), dtype=torch.int32
+    lm_head.weight_scale: shape=torch.Size([90, 201088]), dtype=torch.bfloat16
+    '''
+    from typing import Any, Callable, Optional, cast
+    def create_weights(self, layer: torch.nn.Module,
+                       input_size_per_partition: int,
+                       output_partition_sizes: list[int], input_size: int,
+                       output_size: int, params_dtype: torch.dtype, weight_loader: Callable,
+                       **extra_weight_attrs):
+        from vllm.model_executor.parameter import (BasevLLMParameter,
+                                                BlockQuantScaleParameter,
+                                                PackedColumnParameter,
+                                                PackedvLLMParameter,
+                                                PerTensorScaleParameter,
+                                                RowvLLMParameter)
+        from vllm.model_executor.parameter import (GroupQuantScaleParameter,
+                                           PackedvLLMParameter)
+        """Create weights for embedding layer."""
+
+
+        weight = PackedvLLMParameter( # 
+            data=torch.empty(
+                input_size_per_partition,
+                sum(output_partition_sizes) // 8, 
+                dtype=torch.int32, # bf16
+            ),
+            input_dim=0,
+            output_dim=1,
+            packed_dim=1,
+            packed_factor=8,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+
+        weight_scale = Parameter(torch.empty(input_size_per_partition // 32,
+                                       sum(output_partition_sizes),
+                                       dtype=params_dtype),
+                                       requires_grad=False)
+        layer.register_parameter("weight_scale", weight_scale)
+
+        weight_zero_point = PackedvLLMParameter( # 
+            data=torch.empty(
+                input_size_per_partition // 32, 
+                sum(output_partition_sizes) // 8, 
+                dtype=torch.int32, # bf16
+            ),
+            input_dim=0,
+            output_dim=1,
+            packed_dim=1,
+            packed_factor=8,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_zero_point", weight_zero_point)
+
+
+        set_weight_attrs(weight, extra_weight_attrs)
+        set_weight_attrs(weight_scale, extra_weight_attrs)
+        set_weight_attrs(weight_zero_point, extra_weight_attrs)
+
+
+    def apply(self,
+              layer: torch.nn.Module,
+              x: torch.Tensor,
+              bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        assert hasattr(layer, "float_weight") # use unpacked float weight
+        dq_w = layer.float_weight.to(x.dtype)
+        return F.linear(x, dq_w, bias)
+
+    def embedding(self, layer: torch.nn.Module,
+                  input_: torch.Tensor) -> torch.Tensor:
+        assert hasattr(layer, "float_weight") # use unpacked float weight
+        dq_w = layer.float_weight.to(input_.dtype)
+        return F.embedding(input_, dq_w)

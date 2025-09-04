@@ -11,7 +11,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.layers.quantization.utils.int8_utils import (
     per_token_group_quant_int8, per_token_quant_int8)
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
-    quant_dequant_mxfp4)
+    quant_dequant_mxfp4fp6fp8)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils import cdiv
@@ -169,8 +169,9 @@ def _mxfp4_quantize(
     block_shape: Optional[list[int]] = None,
 ) -> tuple[torch.Tensor, None]:
     assert block_shape is None
-    if not current_platform.supports_mx():
-        A = quant_dequant_mxfp4(A)
+    # if not current_platform.supports_mx():
+    if 1:
+        A = quant_dequant_mxfp4fp6fp8(A)
     else:
         raise NotImplementedError()
 
@@ -193,8 +194,15 @@ def moe_kernel_quantize_input(
         return _fp4_quantize(A,
                              A_scale,
                              is_sf_swizzled_layout=is_fp4_scale_swizzled)
-    elif quant_dtype == "mxfp4":
-        return _mxfp4_quantize(A, A_scale, per_act_token_quant, block_shape)
+    elif quant_dtype == "fp4":
+        A = quant_dequant_mxfp4fp6fp8(A, inp_dtype="fp4")
+        return A, None
+    elif quant_dtype == "fp6_e2m3":
+        A = quant_dequant_mxfp4fp6fp8(A, inp_dtype="fp6_e2m3")
+        return A, None
+    elif quant_dtype == "fp8_e4m3":
+        A = quant_dequant_mxfp4fp6fp8(A, inp_dtype="fp8_e4m3")
+        return A, None
     else:
         return A, A_scale
 
