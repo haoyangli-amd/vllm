@@ -37,7 +37,8 @@ class QuickReduceRegime(Enum):
     INT8 = 1
     INT6 = 2
     INT4 = 3
-    NONE = 4
+    FP4 = 4
+    NONE = 5
 
 
 MB = 1024 * 1024
@@ -49,12 +50,12 @@ class QuickAllReduce:
     # The following data is based on kernel tests.
     # In this order [FP, INT8, INT6, INT4].
     _QR_MIN_SIZE = {
-        (torch.float16, 2): [1 * MB, 2 * MB, 2 * MB, 1 * MB],
-        (torch.float16, 4): [1 * MB, 16 * MB, 4 * MB, 2 * MB],
-        (torch.float16, 8): [16 * MB, 4 * MB, 4 * MB, 2 * MB],
-        (torch.bfloat16, 2): [2 * MB, 8 * MB, 8 * MB, 8 * MB],
-        (torch.bfloat16, 4): [8 * MB, 64 * MB, 64 * MB, 16 * MB],
-        (torch.bfloat16, 8): [16 * MB, 2048 * MB, 2048 * MB, 2048 * MB],
+        (torch.float16, 2): [1 * MB, 2 * MB, 2 * MB, 1 * MB, 1 * MB],
+        (torch.float16, 4): [1 * MB, 16 * MB, 4 * MB, 2 * MB, 2 * MB],
+        (torch.float16, 8): [16 * MB, 4 * MB, 4 * MB, 2 * MB, 2 * MB],
+        (torch.bfloat16, 2): [2 * MB, 8 * MB, 8 * MB, 8 * MB, 8 * MB],
+        (torch.bfloat16, 4): [8 * MB, 64 * MB, 64 * MB, 16 * MB, 16 * MB],
+        (torch.bfloat16, 8): [16 * MB, 2048 * MB, 2048 * MB, 2048 * MB, 2048 * MB],
     }
 
     def __init__(self, group: ProcessGroup, device: int | str | torch.device) -> None:

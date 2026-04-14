@@ -1043,7 +1043,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION": env_with_choices(
         "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION",
         "NONE",
-        ["FP", "INT8", "INT6", "INT4", "NONE"],
+        ["FP", "INT8", "INT6", "INT4", "FP4", "NONE"],
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Due to the lack of the bfloat16 asm instruction, bfloat16

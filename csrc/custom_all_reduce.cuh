@@ -17,6 +17,7 @@ typedef __hip_bfloat16 nv_bfloat16;
 #include <vector>
 #include <cstdlib>
 #include <cstring>
+#define caltime
 
 namespace vllm {
 #define CUDACHECK(cmd)                                              \
@@ -527,6 +528,9 @@ class CustomAllreduce {
   template <typename T>
   void allreduce(cudaStream_t stream, T* input, T* output, int size,
                  int threads = 512, int block_limit = defaultBlockLimit) {
+#ifdef caltime
+    uint32_t msg_size = size * 2; // size * 2 == n bytes
+#endif
     auto d = packed_t<T>::P::size;
     if (size % d != 0)
       throw std::runtime_error(
@@ -600,6 +604,12 @@ class CustomAllreduce {
     break;                                              \
   }
 
+#ifdef caltime
+hipEvent_t start, end;
+hipEventCreate(&start);
+hipEventCreate(&end);
+hipEventRecord(start, stream);
+#endif
     switch (world_size_) {
       REDUCE_CASE(2)
       REDUCE_CASE(4)
@@ -612,6 +622,16 @@ class CustomAllreduce {
             "gpus = " +
             std::to_string(world_size_));
     }
+
+#ifdef caltime
+hipEventRecord(end, stream);
+hipEventSynchronize(end);
+float elapsed_time;
+hipEventElapsedTime(&elapsed_time, start, end);
+if (rank_ == 0) {
+printf("msg_size:%u, quant_level:0, cr_latency:%f\n", msg_size, elapsed_time * 1000);
+}
+#endif
 #undef REDUCE_CASE
 #undef KL
   }

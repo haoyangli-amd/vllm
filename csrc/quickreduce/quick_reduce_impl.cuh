@@ -2,6 +2,8 @@
 
 #include <hip/hip_runtime.h>
 #include "base.h"
+#include <hip/hip_fp16.h>
+#include <hip/hip_fp4.h>
 
 namespace quickreduce {
 
@@ -50,6 +52,120 @@ struct CodecFP : public CodecBase {
     for (int i = 0; i < kRankAtoms; i++) {
       data[i] = __builtin_nontemporal_load(*recv_buffer + thread);
       *recv_buffer += kAtomStride;
+    }
+  }
+};
+
+// Fp4 symmetric quantization codec.
+// We quantize the FP16 data to block-scaled Int8 in blocks of 4 *
+// kThreadGroupSize.
+template <typename T, int world_size>
+struct CodecFP4 : public CodecBase {
+  static constexpr int kWorldSize = world_size;
+
+  // Codec tile size process by this workgroup.
+  // Each threads processes a fragment of fp16x8_t (16B),
+  // into a int4x8_t (4B) and a fp16 scale shared among 32 values.
+  static constexpr int kRankAtoms = kAtoms / kWorldSize;
+  static constexpr int kRankTileStride = 1152;
+  static constexpr int kRankTileScaleOffset = 1024;
+  static constexpr int kRankTransmittedTileSize = kRankTileStride * kRankAtoms;
+  static_assert(kRankTransmittedTileSize % 16 == 0,
+                "kRankTransmittedTileSize must be 16B aligned.");
+
+  static constexpr int kRankBufferTileStride =
+      kRankTileStride / sizeof(int32x4_t);
+
+  // Total tile size for the collective communication.
+  static constexpr int kTransmittedTileSize =
+      kRankTransmittedTileSize * kWorldSize;
+
+  // Constants configuration
+
+  // {1/6.0h, 1/6.0h}, f16x2_t
+  static int constexpr kScaleFactor = 0x31553155;
+
+  // {1e-7, 1e-7}, f16x2_t
+  static constexpr int kScaleEpsilon =
+      std::is_same<T, half>::value ? 0x00010001 : 0x33D733D7;
+
+
+  __quickreduce_device_inline__ CodecFP4(int thread, int rank)
+      : CodecBase(thread, rank) {}
+
+  __quickreduce_device_inline__ void send(int32x4_t* __restrict__ send_buffer,
+                                          const int32x4_t* __restrict__ data) {
+    for (int k = 0; k < kRankAtoms; k++) {
+      int32x4_t const atom = data[k];
+      // Send
+      // Compute the absolute maximum of the atom in the thread group
+      // In 2 blocks of values, upper/lower halves of the f16x2_t
+      int wblockmax = group_abs_max<T>(atom);
+
+      // Derive scales
+      int decoding_scale;
+      int encoding_scale;
+      decoding_scale = packed_mul<T>(wblockmax, kScaleFactor);
+      encoding_scale = packed_add<T>(decoding_scale, kScaleEpsilon);
+      encoding_scale = packed_rcp<T>(encoding_scale);
+
+      // Apply scales to get quantized values
+      int32x4_t w;
+      for (int i = 0; i < 4; i++) {
+        w[i] = packed_mul<T>(atom[i], encoding_scale);
+      }
+
+      float con_scale = 1.0f; // 
+      int32_t qw;
+      __amd_fp16x2_storage_t* y = reinterpret_cast<__amd_fp16x2_storage_t*>(&w);
+      qw = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(qw, y[0], con_scale, 0);
+      qw = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(qw, y[1], con_scale, 1);
+      qw = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(qw, y[2], con_scale, 2);
+      qw = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(qw, y[3], con_scale, 3);
+
+      // Write quantized atom to send_buffer
+      // note: only the group leader stores the scale
+      uint8_t* atom_ptr =
+          reinterpret_cast<uint8_t*>(send_buffer + k * kRankBufferTileStride);
+      int32_t* qw_ptr = reinterpret_cast<int32_t*>(atom_ptr) + thread;
+      int* qs_ptr = reinterpret_cast<int*>(atom_ptr + kRankTileScaleOffset) +
+                    (thread / 8);
+
+      __builtin_nontemporal_store(qw, qw_ptr);
+      if (threadIdx.x == group_leader) {
+        __builtin_nontemporal_store(decoding_scale, qs_ptr);
+      }
+    }
+  }
+
+  __quickreduce_device_inline__ void recv(int32x4_t** __restrict__ recv_buffer,
+                                          int32x4_t* __restrict__ data) {
+    for (int k = 0; k < kRankAtoms; k++) {
+      // Directly read quantized atom from recv_buffer
+      uint8_t* atom_ptr = reinterpret_cast<uint8_t*>(*recv_buffer);
+      int32_t* qw_ptr = reinterpret_cast<int32_t*>(atom_ptr) + thread;
+      int* qs_ptr = reinterpret_cast<int*>(atom_ptr + kRankTileScaleOffset) +
+                    (thread / 8);
+
+      int32_t qw = __builtin_nontemporal_load(qw_ptr);
+      int qs = __builtin_nontemporal_load(qs_ptr);
+
+      *recv_buffer += kRankBufferTileStride;
+      // Recv
+      int32x4_t w;{
+          __amd_fp16x2_storage_t* y = reinterpret_cast<__amd_fp16x2_storage_t*>(&w);
+          __hip_fp4x2_storage_t* qww = reinterpret_cast<__hip_fp4x2_storage_t*>(&qw);
+          y[0] = __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(qww[0], 1.0f, 0);
+          y[1] = __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(qww[1], 1.0f, 0);
+          y[2] = __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(qww[2], 1.0f, 0);
+          y[3] = __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(qww[3], 1.0f, 0);
+      }
+      // Apply decoding scales
+      for (int i = 0; i < 4; i++) {
+        w[i] = packed_mul<T>(w[i], qs);
+      }
+
+      data[k] = w;
     }
   }
 };
@@ -539,6 +655,66 @@ struct CodecQ8 : public CodecBase {
   }
 };
 
+template <typename T>
+__quickreduce_device_inline__ T float_to_scalar(float v);
+
+template <>
+__quickreduce_device_inline__ half float_to_scalar<half>(float v) {
+  return __float2half_rn(v);
+}
+
+template <>
+__quickreduce_device_inline__ nv_bfloat16 float_to_scalar<nv_bfloat16>(float v) {
+  return __float2bfloat16(v);
+}
+
+template <typename T>
+__quickreduce_device_inline__ void rotate_group32_hadamard(int32x4_t* atom) {
+  // Normalized 32-d orthogonal transform on each thread-group (8 threads):
+  // first H4 within each thread, then H8 across the 8-thread group.
+  // This yields a 32x32 rotation (H4 ⊗ H8), and inverse == forward.
+  constexpr float kInvSqrt32 = 0.1767766952966369f;  // 1/sqrt(32)
+  T* vals = reinterpret_cast<T*>(atom);
+
+  // Process low/high lanes of each packed pair independently.
+#pragma unroll
+  for (int parity = 0; parity < 2; ++parity) {
+    float v0 = T2float_cast(vals[parity + 0 * 2]);
+    float v1 = T2float_cast(vals[parity + 1 * 2]);
+    float v2 = T2float_cast(vals[parity + 2 * 2]);
+    float v3 = T2float_cast(vals[parity + 3 * 2]);
+
+    // H4 within thread (unnormalized).
+    float t0 = v0 + v1;
+    float t1 = v0 - v1;
+    float t2 = v2 + v3;
+    float t3 = v2 - v3;
+    float w0 = t0 + t2;
+    float w1 = t1 + t3;
+    float w2 = t0 - t2;
+    float w3 = t1 - t3;
+
+    float vec[4] = {w0, w1, w2, w3};
+
+    // H8 across thread-group via xor-shuffle (unnormalized).
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      float x = vec[c];
+#pragma unroll
+      for (int step = 1; step < kThreadGroupSize; step <<= 1) {
+        float y = __shfl_xor(x, step, kThreadGroupSize);
+        x = (threadIdx.x & step) ? (x - y) : (x + y);
+      }
+      vec[c] = x * kInvSqrt32;
+    }
+
+    vals[parity + 0 * 2] = float_to_scalar<T>(vec[0]);
+    vals[parity + 1 * 2] = float_to_scalar<T>(vec[1]);
+    vals[parity + 2 * 2] = float_to_scalar<T>(vec[2]);
+    vals[parity + 3 * 2] = float_to_scalar<T>(vec[3]);
+  }
+}
+
 // Twoshot All Reduce
 template <typename T, class Codec, bool cast_bf2half>
 struct AllReduceTwoshot {
@@ -580,6 +756,7 @@ struct AllReduceTwoshot {
         }
         tA[i] = *reinterpret_cast<const int32x4_t*>(half_buf);
       }
+      // rotate_group32_hadamard<T>(&tA[i]);
     }
 
     // --------------------------------------------------------
@@ -666,6 +843,12 @@ struct AllReduceTwoshot {
         // Gather all reduced and final rank segments into tA.
         codec.recv(&recv_buffer, &tA[r * Codec::kRankAtoms]);
       }
+    }
+
+    // Apply inverse rotation before writing the final output.
+    // For normalized Hadamard-based rotation, inverse == forward.
+    for (int i = 0; i < kAtoms; i++) {
+      // rotate_group32_hadamard<T>(&tA[i]);
     }
 
     // --------------------------------------------------------
