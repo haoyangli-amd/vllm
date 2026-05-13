@@ -2,7 +2,13 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/all.h>
-
+// 2041
+// u FIX: H8 xor-shuffle butterfly high-lane uses y-x (was x-y, gave D8*H8 not H8 -> non-self-inverse)
+// -- CodecQ3 rev 6: codebook now matches turboquant-plus exactly. Centroids
+//    are 1000-iter Lloyd-Max for unit-variance Gaussian, normalized to
+//    [-1, +1] by dividing by the outer centroid. Encoder switches to a
+//    3-step binary search through the 7 boundaries (always 3 comparisons
+//    per element). Decoder remains the explicit kCodebook[idx] lookup.
 #ifdef USE_ROCM
 
   #include "quickreduce/quick_reduce.h"
@@ -90,25 +96,35 @@ int64_t qr_max_size() {
   return static_cast<int64_t>(std::numeric_limits<int32_t>::max()) + 1;
 }
 
-  #define INSTANTIATE_FOR_WORLDSIZE(T, Codec, cast_bf2half)       \
-    template struct quickreduce::AllReduceTwoshot<T, Codec<T, 2>, \
-                                                  cast_bf2half>;  \
-    template struct quickreduce::AllReduceTwoshot<T, Codec<T, 4>, \
-                                                  cast_bf2half>;  \
-    template struct quickreduce::AllReduceTwoshot<T, Codec<T, 8>, cast_bf2half>;
+  #define INSTANTIATE_FOR_WORLDSIZE(T, Codec, cast_bf2half)                \
+    template struct quickreduce::AllReduceTwoshot<T, Codec<T, 2>,          \
+                                                  cast_bf2half>;           \
+    template struct quickreduce::AllReduceTwoshot<T, Codec<T, 4>,          \
+                                                  cast_bf2half>;           \
+    template struct quickreduce::AllReduceTwoshot<T, Codec<T, 8>,          \
+                                                  cast_bf2half>;
 
 INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecFP, false)
 INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ4, false)
+INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecFP4, false)
 INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ6, false)
 INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ8, false)
+INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ3, false)
+INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ2, false)
 INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecFP, true)
 INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ4, true)
+INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecFP4, true)
 INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ6, true)
 INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ8, true)
+INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ3, true)
+INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ2, true)
 
 INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecFP, false)
 INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ4, false)
+INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecFP4, false)
 INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ6, false)
 INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ8, false)
+INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ3, false)
+INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ2, false)
 
 #endif  // USE_ROCM
