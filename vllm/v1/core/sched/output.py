@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -124,6 +124,9 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    # Per-request "inside <think>...</think>" flag. Empty when the relaxed
+    # thinking feature is disabled; otherwise aligned with `req_ids`.
+    thinking_states: list[bool] = field(default_factory=list)
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:

@@ -45,7 +45,11 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
-from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sched.utils import (
+    check_stop,
+    maybe_update_thinking_state,
+    remove_all,
+)
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -209,6 +213,14 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
+        # Relaxed-thinking state: when enabled the scheduler tracks per-request
+        # <think> spans and forwards a per-request flag to the worker so the
+        # rejection sampler can apply the relaxed top-k accept rule. See
+        # SpeculativeConfig.relaxed_thinking.
+        self.relaxed_thinking = False
+        self.think_start_token_id: int | None = None
+        self.think_end_token_id: int | None = None
+        self._reasoning_parser = None
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
             if speculative_config.use_eagle():
@@ -216,6 +228,8 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
+            if speculative_config.relaxed_thinking:
+                self._init_relaxed_thinking(speculative_config)
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -254,6 +268,53 @@ class Scheduler(SchedulerInterface):
             self.perf_metrics = ModelMetrics(vllm_config)
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+
+    def _init_relaxed_thinking(self, speculative_config) -> None:
+        """Resolve `<think>`/`</think>` token IDs from the configured reasoning
+        parser so the scheduler can toggle each request's thinking_state."""
+        from transformers import AutoTokenizer
+
+        from vllm.reasoning import ReasoningParserManager
+
+        parser_name = speculative_config.reasoning_parser
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.vllm_config.model_config.tokenizer
+        )
+        try:
+            parser_cls = ReasoningParserManager.get_reasoning_parser(parser_name)
+            parser = parser_cls(tokenizer)
+        except Exception as e:  # pragma: no cover - configuration error path
+            raise TypeError(
+                f"Reasoning parser '{parser_name}' has not been registered."
+            ) from e
+
+        # Cover both naming conventions used across reasoning parsers.
+        if hasattr(parser, "start_token_id") and hasattr(parser, "end_token_id"):
+            self.think_start_token_id = parser.start_token_id
+            self.think_end_token_id = parser.end_token_id
+        elif hasattr(parser, "think_start_token_id") and hasattr(
+            parser, "think_end_token_id"
+        ):
+            self.think_start_token_id = parser.think_start_token_id
+            self.think_end_token_id = parser.think_end_token_id
+        else:
+            raise AttributeError(
+                f"Reasoning parser '{parser_name}' does not expose "
+                "(start_token_id, end_token_id) or "
+                "(think_start_token_id, think_end_token_id)."
+            )
+
+        self.relaxed_thinking = True
+        self._reasoning_parser = parser
+        logger.info(
+            "Relaxed thinking enabled: relax_ratio=%.3f, relax_top_k=%d, "
+            "reasoning_parser=%s, think_start_id=%s, think_end_id=%s",
+            speculative_config.relax_ratio,
+            speculative_config.relax_top_k,
+            parser_name,
+            self.think_start_token_id,
+            self.think_end_token_id,
+        )
 
     def _mamba_block_aligned_split(
         self,
@@ -1010,6 +1071,7 @@ class Scheduler(SchedulerInterface):
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
+        thinking_states: list[bool] = []
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -1045,6 +1107,8 @@ class Scheduler(SchedulerInterface):
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
             )
+            if self.relaxed_thinking:
+                thinking_states.append(req.thinking_state)
 
         return CachedRequestData(
             req_ids=req_ids,
@@ -1054,6 +1118,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            thinking_states=thinking_states,
         )
 
     def _try_schedule_encoder_inputs(
@@ -1562,6 +1627,13 @@ class Scheduler(SchedulerInterface):
         # to return empty token ids for the request.
         stopped = False
         for num_new, output_token_id in enumerate(new_token_ids, 1):
+            if self.relaxed_thinking:
+                maybe_update_thinking_state(
+                    request,
+                    output_token_id,
+                    self.think_start_token_id,
+                    self.think_end_token_id,
+                )
             request.append_output_token_ids(output_token_id)
 
             # Check for stop and update request state.
@@ -1677,6 +1749,17 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            # Some chat templates (e.g. DeepSeek-R1) inject `<think>` directly
+            # into the prompt, so the model never emits the start token. Seed
+            # `thinking_state` from the prompt so relaxed acceptance kicks in.
+            if self.relaxed_thinking and request.prompt_token_ids:
+                start_id = self.think_start_token_id
+                if start_id is not None and start_id in request.prompt_token_ids:
+                    request.thinking_state = (
+                        not self._reasoning_parser.is_reasoning_end(
+                            request.prompt_token_ids
+                        )
+                    )
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:

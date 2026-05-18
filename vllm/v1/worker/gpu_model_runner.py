@@ -3413,10 +3413,34 @@ class GPUModelRunner(
             ec_connector_output,
         )
 
+    def _build_thinking_states_tensor(
+        self,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> torch.Tensor | None:
+        """Build a `[batch_size]` bool tensor of per-request thinking_state,
+        aligned with `input_batch.req_ids` order (which is what the rejection
+        sampler kernel uses via program_id). Returns None when relaxed thinking
+        is disabled or there is nothing to spec-decode this step."""
+        if (
+            spec_decode_metadata is None
+            or self.speculative_config is None
+            or not getattr(self.speculative_config, "relaxed_thinking", False)
+        ):
+            return None
+        cached = scheduler_output.scheduled_cached_reqs
+        # Map req_id -> thinking_state from this step's cached requests; new
+        # (prefilling) requests aren't in cached but they have no draft tokens
+        # either, so defaulting to False is safe.
+        state_map = dict(zip(cached.req_ids, cached.thinking_states))
+        states = [state_map.get(rid, False) for rid in self.input_batch.req_ids]
+        return torch.tensor(states, dtype=torch.bool, device=self.device)
+
     def _sample(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        thinking_states: torch.Tensor | None = None,
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
@@ -3441,6 +3465,7 @@ class GPUModelRunner(
             draft_probs,
             logits,
             sampling_metadata,
+            thinking_states=thinking_states,
         )
         return sampler_output
 
@@ -4267,7 +4292,12 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            thinking_states = self._build_thinking_states_tensor(
+                scheduler_output, spec_decode_metadata
+            )
+            sampler_output = self._sample(
+                logits, spec_decode_metadata, thinking_states=thinking_states
+            )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -5879,11 +5909,17 @@ class GPUModelRunner(
                 device=self.device,
                 dtype=logits.dtype,
             )
+            dummy_thinking_states = None
+            if getattr(self.speculative_config, "relaxed_thinking", False):
+                dummy_thinking_states = torch.zeros(
+                    num_reqs, dtype=torch.bool, device=self.device
+                )
             self.rejection_sampler(
                 dummy_spec_decode_metadata,
                 draft_probs,
                 logits,
                 dummy_metadata,
+                thinking_states=dummy_thinking_states,
             )
         return sampler_output
 

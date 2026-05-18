@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -84,6 +85,28 @@ class RejectionSampler(nn.Module):
             )
         self.synthetic_mode = self.synthetic_conditional_rates is not None
 
+        # Relaxed thinking (PR #22238 port). Only the greedy path is relaxed:
+        # while a request is inside its <think> span, accept a draft if it lies
+        # in the target's top-`relax_top_k` and its logit is within
+        # `-log(relax_ratio)` of the argmax logit.
+        # Use `is True` to avoid being tricked by a Mock attribute in tests.
+        self.relaxed_thinking = (
+            spec_config is not None
+            and getattr(spec_config, "relaxed_thinking", False) is True
+        )
+        self.relax_top_k = (
+            spec_config.relax_top_k if self.relaxed_thinking else 1
+        )
+        # Cache log(ratio) for logit-space comparison (avoids a vocab softmax).
+        self.log_relax_ratio = (
+            math.log(spec_config.relax_ratio) if self.relaxed_thinking else 0.0
+        )
+        if self.relaxed_thinking and self.synthetic_mode:
+            raise ValueError(
+                "relaxed_thinking is incompatible with the synthetic rejection "
+                "sampling mode."
+            )
+
     def forward(
         self,
         metadata: SpecDecodeMetadata,
@@ -92,6 +115,9 @@ class RejectionSampler(nn.Module):
         # [num_tokens + batch_size, vocab_size]
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        # [batch_size] bool, aligned with input_batch.req_ids order. Only
+        # consulted when self.relaxed_thinking is True.
+        thinking_states: torch.Tensor | None = None,
     ) -> SamplerOutput:
         """
         Args:
@@ -176,6 +202,10 @@ class RejectionSampler(nn.Module):
             sampling_metadata,
             synthetic_mode=self.synthetic_mode,
             synthetic_conditional_rates=self.synthetic_conditional_rates,
+            relaxed_thinking=self.relaxed_thinking,
+            relax_top_k=self.relax_top_k,
+            log_relax_ratio=self.log_relax_ratio,
+            thinking_states=thinking_states,
         )
 
         logprobs_tensors = None
@@ -406,6 +436,11 @@ def rejection_sample(
     sampling_metadata: SamplingMetadata,
     synthetic_mode: bool = False,
     synthetic_conditional_rates: torch.Tensor | None = None,
+    relaxed_thinking: bool = False,
+    relax_top_k: int = 1,
+    log_relax_ratio: float = 0.0,
+    # [batch_size] bool, optional. Required when relaxed_thinking is True.
+    thinking_states: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
@@ -449,19 +484,45 @@ def rejection_sample(
 
     if not sampling_metadata.all_random:
         # Rejection sampling for greedy sampling requests.
-        target_argmax = target_logits.argmax(dim=-1)
-        rejection_greedy_sample_kernel[(batch_size,)](
-            output_token_ids,
-            cu_num_draft_tokens,
-            draft_token_ids,
-            target_argmax,
-            bonus_token_ids,
-            is_greedy,
-            max_spec_len,
-            uniform_probs,
-            synthetic_conditional_rates,
-            SYNTHETIC_MODE=synthetic_mode,
-        )
+        if relaxed_thinking:
+            # Top-k matching with logit-space ratio threshold during <think>.
+            # See SpeculativeConfig.relaxed_thinking and PR #22238.
+            assert thinking_states is not None, (
+                "thinking_states must be provided when relaxed_thinking is on"
+            )
+            assert thinking_states.dtype == torch.bool
+            assert thinking_states.shape[0] == batch_size
+            topk_logits, topk_indices = torch.topk(
+                target_logits, k=relax_top_k, dim=-1
+            )
+            topk_indices = topk_indices.to(torch.int32)
+            relaxed_thinking_sample_kernel[(batch_size,)](
+                output_token_ids,
+                cu_num_draft_tokens,
+                draft_token_ids,
+                topk_logits,
+                topk_indices,
+                bonus_token_ids,
+                is_greedy,
+                thinking_states,
+                max_spec_len,
+                log_relax_ratio,
+                RELAX_TOP_K=relax_top_k,
+            )
+        else:
+            target_argmax = target_logits.argmax(dim=-1)
+            rejection_greedy_sample_kernel[(batch_size,)](
+                output_token_ids,
+                cu_num_draft_tokens,
+                draft_token_ids,
+                target_argmax,
+                bonus_token_ids,
+                is_greedy,
+                max_spec_len,
+                uniform_probs,
+                synthetic_conditional_rates,
+                SYNTHETIC_MODE=synthetic_mode,
+            )
         if sampling_metadata.all_greedy:
             return output_token_ids
 
@@ -701,6 +762,81 @@ def sample_recovered_tokens(
         NO_DRAFT_PROBS=draft_probs is None,
     )
     return recovered_token_ids
+
+
+# Top-k relaxed accept kernel for the greedy path. While a request is inside
+# its reasoning (<think>...</think>) span, accept a draft token if it lies in
+# the target's top-`RELAX_TOP_K` AND its logit is within `-log_relax_ratio`
+# of the argmax logit. Outside the span the kernel degrades to the strict
+# top-1 match (identical to rejection_greedy_sample_kernel without synthetic
+# mode), which keeps post-thinking output bit-identical to the strict path.
+@triton.jit(do_not_specialize=["max_spec_len", "log_relax_ratio"])
+def relaxed_thinking_sample_kernel(
+    output_token_ids_ptr,  # [batch_size, max_spec_len + 1]
+    cu_num_draft_tokens_ptr,  # [batch_size]
+    draft_token_ids_ptr,  # [num_tokens]
+    topk_logits_ptr,  # [num_tokens, RELAX_TOP_K] float32
+    topk_indices_ptr,  # [num_tokens, RELAX_TOP_K] int32
+    bonus_token_ids_ptr,  # [batch_size]
+    is_greedy_ptr,  # [batch_size] or None
+    thinking_states_ptr,  # [batch_size] bool
+    max_spec_len,
+    log_relax_ratio,  # <= 0; in_thinking accept iff cand_logit - top1 >= this
+    RELAX_TOP_K: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    is_greedy = True if is_greedy_ptr is None else tl.load(is_greedy_ptr + req_idx)
+    if not is_greedy:
+        return
+
+    start_idx = 0 if req_idx == 0 else tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
+    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
+    num_draft_tokens = end_idx - start_idx
+
+    in_thinking = tl.load(thinking_states_ptr + req_idx)
+
+    rejected = False
+    for pos in range(num_draft_tokens):
+        if not rejected:
+            draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
+            row_offset = (start_idx + pos) * RELAX_TOP_K
+            top1_logit = tl.load(topk_logits_ptr + row_offset)
+            top1_token_id = tl.load(topk_indices_ptr + row_offset).to(tl.int32)
+
+            # Default: strict greedy match against top-1.
+            token_id = top1_token_id
+            cur_pos_accepted = draft_token_id == top1_token_id
+
+            if in_thinking and not cur_pos_accepted:
+                # Try the remaining top-k candidates with the logit threshold.
+                for i in range(1, RELAX_TOP_K):
+                    if not cur_pos_accepted:
+                        cand_logit = tl.load(topk_logits_ptr + row_offset + i)
+                        cand_token_id = tl.load(
+                            topk_indices_ptr + row_offset + i
+                        ).to(tl.int32)
+                        if (cand_logit - top1_logit) >= log_relax_ratio and (
+                            draft_token_id == cand_token_id
+                        ):
+                            token_id = draft_token_id
+                            cur_pos_accepted = True
+
+            if cur_pos_accepted:
+                token_id = draft_token_id
+            else:
+                rejected = True
+                # token_id stays as the target's top-1 (strict recover).
+            tl.store(
+                output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
+                token_id,
+            )
+
+    if not rejected:
+        bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
+        tl.store(
+            output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_draft_tokens,
+            bonus_token_id,
+        )
 
 
 # NOTE(woosuk): Avoid specialization to prevent unnecessary recompilation.

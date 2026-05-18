@@ -98,6 +98,12 @@ class Request:
         self.events: list[EngineCoreEvent] = []
         self.stop_reason: int | str | None = None
 
+        # Whether the request is currently inside a <think>...</think> span.
+        # Toggled by the scheduler via maybe_update_thinking_state when a
+        # reasoning parser's start/end token id is observed in generated tokens.
+        # Consumed by the rejection sampler when relaxed_thinking is enabled.
+        self.thinking_state: bool = False
+
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
 

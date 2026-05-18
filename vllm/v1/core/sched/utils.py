@@ -91,6 +91,21 @@ def remove_all(lst: list, items_to_remove: set) -> list:
     return [item for item in lst if item not in items_to_remove]
 
 
+def maybe_update_thinking_state(
+    request: Request,
+    new_token_id: int,
+    think_start_token_id: int | None,
+    think_end_token_id: int | None,
+) -> None:
+    """Toggle `request.thinking_state` when the reasoning span boundary tokens
+    are observed. Called per generated token from the scheduler when relaxed
+    thinking is enabled."""
+    if think_start_token_id is not None and new_token_id == think_start_token_id:
+        request.thinking_state = True
+    if think_end_token_id is not None and new_token_id == think_end_token_id:
+        request.thinking_state = False
+
+
 def check_stop(request: Request, max_model_len: int) -> bool:
     assert not request.pooling_params
 

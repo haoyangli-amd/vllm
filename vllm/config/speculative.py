@@ -253,6 +253,34 @@ class SpeculativeConfig:
             )
         return SpeculativeConfig._acceptance_length_to_rates(length, n)
 
+    # Relaxed acceptance for thinking tokens (ported from PR #22238).
+    relaxed_thinking: bool = False
+    """If True, relax the rejection sampler's accept criterion while the request
+    is inside its <think>...</think> reasoning span: accept a draft token when
+    it appears within the target model's top-`relax_top_k` tokens AND its logit
+    is no more than ``-log(relax_ratio)`` below the target argmax logit.
+
+    Outside the thinking span (and for non-greedy requests) the standard strict
+    accept rule still applies. Requires `reasoning_parser` to be set."""
+
+    relax_ratio: float = 1.0
+    """Probability ratio threshold for relaxed acceptance (only used when
+    `relaxed_thinking=True`). A draft token is accepted only if its target
+    probability is at least `relax_ratio * top1_prob`. Must lie in (0, 1).
+    Implementation compares logits with `log(relax_ratio)` to avoid a vocab
+    softmax."""
+
+    relax_top_k: int = 1
+    """Top-k value for relaxed acceptance (only used when `relaxed_thinking=True`).
+    A draft token is considered for acceptance only if it lies within the
+    target model's top-k tokens. Must be >= 1; with k=1 the relaxed rule
+    degrades to strict greedy matching."""
+
+    reasoning_parser: str | None = None
+    """Name of a registered reasoning parser used to obtain the
+    `<think>` start/end token ids that delimit the relaxed-accept window.
+    Required when `relaxed_thinking=True`."""
+
     draft_sample_method: DraftSampleMethod = "greedy"
     """How the draft model samples tokens. 'greedy' always picks the argmax
     token, and the draft probabilities are treated as one-hot during rejection
@@ -995,6 +1023,28 @@ class SpeculativeConfig:
                 "synthetic_acceptance_rates / synthetic_acceptance_length "
                 "are only valid with rejection_sample_method='synthetic'."
             )
+
+        if self.relaxed_thinking:
+            if not (0.0 < self.relax_ratio < 1.0):
+                raise ValueError(
+                    "relax_ratio must lie in (0, 1) when relaxed_thinking is "
+                    f"enabled, got {self.relax_ratio}."
+                )
+            if self.relax_top_k < 1:
+                raise ValueError(
+                    "relax_top_k must be >= 1 when relaxed_thinking is enabled, "
+                    f"got {self.relax_top_k}."
+                )
+            if not self.reasoning_parser:
+                raise ValueError(
+                    "reasoning_parser is required when relaxed_thinking is "
+                    "enabled."
+                )
+            if self.rejection_sample_method == "synthetic":
+                raise ValueError(
+                    "relaxed_thinking is incompatible with "
+                    "rejection_sample_method='synthetic'."
+                )
 
         if self.draft_model_config:
             self.draft_model_config.verify_with_parallel_config(
