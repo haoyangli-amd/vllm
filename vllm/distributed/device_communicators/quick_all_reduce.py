@@ -32,11 +32,15 @@ def is_weak_contiguous(inp: torch.Tensor):
 
 
 class QuickReduceRegime(Enum):
+    # Keep integer ids aligned with csrc/quickreduce/quick_reduce.h
     FP = 0
     INT8 = 1
     INT6 = 2
     INT4 = 3
-    NONE = 4
+    FP4 = 4
+    INT3 = 5
+    INT2 = 6
+    NONE = 7
 
 
 MB = 1024 * 1024
@@ -46,14 +50,22 @@ class QuickAllReduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
     _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
     # The following data is based on kernel tests.
-    # In this order [FP, INT8, INT6, INT4].
+    # In this order [FP, INT8, INT6, INT4, FP4, INT3, INT2].
     _QR_MIN_SIZE = {
-        (torch.float16, 2): [1 * MB, 2 * MB, 2 * MB, 1 * MB],
-        (torch.float16, 4): [1 * MB, 16 * MB, 4 * MB, 2 * MB],
-        (torch.float16, 8): [16 * MB, 4 * MB, 4 * MB, 2 * MB],
-        (torch.bfloat16, 2): [2 * MB, 8 * MB, 8 * MB, 8 * MB],
-        (torch.bfloat16, 4): [8 * MB, 64 * MB, 64 * MB, 16 * MB],
-        (torch.bfloat16, 8): [16 * MB, 2048 * MB, 2048 * MB, 2048 * MB],
+        (torch.float16, 2): [1 * MB, 2 * MB, 2 * MB, 1 * MB, 1 * MB, 1 * MB, 1 * MB],
+        (torch.float16, 4): [1 * MB, 16 * MB, 4 * MB, 2 * MB, 2 * MB, 2 * MB, 2 * MB],
+        (torch.float16, 8): [16 * MB, 4 * MB, 4 * MB, 2 * MB, 2 * MB, 2 * MB, 2 * MB],
+        (torch.bfloat16, 2): [2 * MB, 8 * MB, 8 * MB, 8 * MB, 8 * MB, 8 * MB, 8 * MB],
+        (torch.bfloat16, 4): [8 * MB, 64 * MB, 64 * MB, 16 * MB, 16 * MB, 16 * MB, 16 * MB],
+        (torch.bfloat16, 8): [
+            16 * MB,
+            2048 * MB,
+            2048 * MB,
+            2048 * MB,
+            2048 * MB,
+            2048 * MB,
+            2048 * MB,
+        ],
     }
 
     def __init__(self, group: ProcessGroup, device: int | str | torch.device) -> None:
@@ -62,7 +74,7 @@ class QuickAllReduce:
         available for CUDA and ROCm MI300 series.
 
         Custom quick allreduce leverages quantization for further
-        acceleration on ROCm. It currently supports Q8, Q6, and Q4
+        acceleration on ROCm. It currently supports Q8, Q6, Q4, Q3, and Q2
         quantization formats and FP(float16, bfloat16).
 
         Quick allreduce is designed as a complement to custom allreduce.

@@ -116,7 +116,7 @@ def eager_quickreduce(
 @pytest.mark.skipif(
     not current_platform.is_rocm(), reason="only test quick allreduce for rocm"
 )
-@pytest.mark.parametrize("quant_mode", ["FP", "INT8", "INT6", "INT4"])
+@pytest.mark.parametrize("quant_mode", ["FP", "INT8", "INT6", "INT4", "FP4", "INT3", "INT2"])
 @pytest.mark.parametrize("tp_size", [2])
 @pytest.mark.parametrize("pipeline_parallel_size", [1, 2])
 @pytest.mark.parametrize("test_target", [graph_quickreduce, eager_quickreduce])
@@ -175,7 +175,7 @@ def qr_variable_input(rank, world_size):
             s2 = 2048
             inp1 = torch.ones((s1, s2), dtype=dtype, device=device_idx)
         result = torch.empty_like(inp1)
-        # FP = 0 INT8 = 1 INT6 = 2 INT4 = 3 NONE = 4
+        # FP = 0 INT8 = 1 INT6 = 2 INT4 = 3 FP4 = 4 INT3 = 5 INT2 = 6
         ops.qr_all_reduce(_ptr, inp1, result, 3, cast_bf2half=True)
         try:
             if inp1[0, 0] == 0:
