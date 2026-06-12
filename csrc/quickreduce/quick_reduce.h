@@ -3,6 +3,7 @@
 #include <vector>
 #include <hip/hip_runtime.h>
 #include "quick_reduce_impl.cuh"
+// #define caltime
 
 #define HIP_CHECK(err)                                                     \
   do {                                                                     \
@@ -35,35 +36,55 @@ allreduce_prototype_twoshot(T const* A, T* B, uint32_t N, uint32_t num_blocks,
   }
 }
 
-#define TWOSHOT_DISPATCH(__codec)                                           \
-  if (world_size == 2) {                                                    \
-    using LineCodec = __codec<T, 2>;                                        \
-    using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>;   \
-    hipLaunchKernelGGL((allreduce_prototype_twoshot<AllReduceKernel, T>),   \
-                       dim3(grid), dim3(kBlockTwoShot), 0, stream, A, B, N, \
-                       num_blocks, rank, dbuffer_list, data_offset,         \
-                       flag_color, this->kMaxProblemSize);                  \
-  } else if (world_size == 4) {                                             \
-    using LineCodec = __codec<T, 4>;                                        \
-    using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>;   \
-    hipLaunchKernelGGL((allreduce_prototype_twoshot<AllReduceKernel, T>),   \
-                       dim3(grid), dim3(kBlockTwoShot), 0, stream, A, B, N, \
-                       num_blocks, rank, dbuffer_list, data_offset,         \
-                       flag_color, this->kMaxProblemSize);                  \
-  } else if (world_size == 8) {                                             \
-    using LineCodec = __codec<T, 8>;                                        \
-    using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>;   \
-    hipLaunchKernelGGL((allreduce_prototype_twoshot<AllReduceKernel, T>),   \
-                       dim3(grid), dim3(kBlockTwoShot), 0, stream, A, B, N, \
-                       num_blocks, rank, dbuffer_list, data_offset,         \
-                       flag_color, this->kMaxProblemSize);                  \
+#define TWOSHOT_DISPATCH(__codec)                                            \
+  if (world_size == 2) {                                                     \
+    using LineCodec = __codec<T, 2>;                                         \
+    using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>;    \
+    hipLaunchKernelGGL((allreduce_prototype_twoshot<AllReduceKernel, T>),    \
+                       dim3(grid), dim3(kBlockTwoShot), 0, stream, A, B, N,  \
+                       num_blocks, rank, dbuffer_list, data_offset,          \
+                       flag_color, this->kMaxProblemSize);                   \
+  } else if (world_size == 4) {                                              \
+    using LineCodec = __codec<T, 4>;                                         \
+    using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>;    \
+    hipLaunchKernelGGL((allreduce_prototype_twoshot<AllReduceKernel, T>),    \
+                       dim3(grid), dim3(kBlockTwoShot), 0, stream, A, B, N,  \
+                       num_blocks, rank, dbuffer_list, data_offset,          \
+                       flag_color, this->kMaxProblemSize);                   \
+  } else if (world_size == 8) {                                              \
+    using LineCodec = __codec<T, 8>;                                         \
+    using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>;    \
+    hipLaunchKernelGGL((allreduce_prototype_twoshot<AllReduceKernel, T>),    \
+                       dim3(grid), dim3(kBlockTwoShot), 0, stream, A, B, N,  \
+                       num_blocks, rank, dbuffer_list, data_offset,          \
+                       flag_color, this->kMaxProblemSize);                   \
+  }
+
+// INT3 only retains good performance on TP2 (world_size == 2). On TP4/TP8
+// the 3-bit codec's pack/unpack overhead outweighs the reduced communication
+// volume, so INT3 is restricted to a TP2-only dispatch here.
+#define TWOSHOT_DISPATCH_TP2_ONLY(__codec)                                   \
+  if (world_size == 2) {                                                     \
+    using LineCodec = __codec<T, 2>;                                         \
+    using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>;    \
+    hipLaunchKernelGGL((allreduce_prototype_twoshot<AllReduceKernel, T>),    \
+                       dim3(grid), dim3(kBlockTwoShot), 0, stream, A, B, N,  \
+                       num_blocks, rank, dbuffer_list, data_offset,          \
+                       flag_color, this->kMaxProblemSize);                   \
+  } else {                                                                   \
+    throw std::runtime_error(                                                \
+        "INT3 quick all-reduce is only supported for world_size == 2 "       \
+        "(TP2); use INT4/NONE for larger world sizes.");                     \
   }
 
 enum QuickReduceQuantLevel {
-  F16 = 0,
-  INT8 = 1,
-  INT6 = 2,
-  INT4 = 3,
+  // Keep these ids in sync with Python QuickReduceRegime enum.
+  F16 = 0,   // full-precision fp16/bf16 communication
+  INT8 = 1,  // symmetric int8 + per-block scale
+  INT6 = 2,  // symmetric int6 + per-block scale
+  INT4 = 3,  // symmetric int4 + per-block scale
+  FP4 = 4,   // fp4 payload + per-block scale
+  INT3 = 5,  // symmetric int3 + per-block scale (TP2 only)
 };
 
 struct DeviceComms {
@@ -174,6 +195,12 @@ struct DeviceComms {
     uint32_t num_blocks = divceil(msg_size, kTileSize);
     uint32_t grid = min(kMaxNumBlocks, num_blocks);
     auto quant_level_ = static_cast<QuickReduceQuantLevel>(quant_level);
+#ifdef caltime
+  hipEvent_t start, end;
+  hipEventCreate(&start);
+  hipEventCreate(&end);
+  hipEventRecord(start, stream);
+#endif
     switch (quant_level_) {
       case QuickReduceQuantLevel::INT8:
         TWOSHOT_DISPATCH(CodecQ8)
@@ -184,10 +211,25 @@ struct DeviceComms {
       case QuickReduceQuantLevel::INT4:
         TWOSHOT_DISPATCH(CodecQ4)
         break;
+      case QuickReduceQuantLevel::FP4:
+        TWOSHOT_DISPATCH(CodecFP4)
+        break;
+      case QuickReduceQuantLevel::INT3:
+        TWOSHOT_DISPATCH_TP2_ONLY(CodecQ3)
+        break;
       default:
         TWOSHOT_DISPATCH(CodecFP)
         break;
     }
+#ifdef caltime
+  hipEventRecord(end, stream);
+  hipEventSynchronize(end);
+  float elapsed_time;
+  hipEventElapsedTime(&elapsed_time, start, end);
+  if (rank == 0) {
+  printf("msg_size:%u, quant_level:%d, qr_latency:%f\n", msg_size, quant_level, elapsed_time * 1000);
+  }
+#endif
     HIP_CHECK(cudaGetLastError());
     // Rotate the flag color.
     flag_color += divceil(N, grid);

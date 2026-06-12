@@ -211,7 +211,7 @@ if TYPE_CHECKING:
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_USE_NVFP4_CT_EMULATIONS: bool = False
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
-        "FP", "INT8", "INT6", "INT4", "NONE"
+        "FP", "INT8", "INT6", "INT4", "FP4", "INT3", "NONE"
     ] = "NONE"
     VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16: bool = True
     VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: int | None = None
@@ -603,11 +603,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs
-    "MAX_JOBS": lambda: os.getenv("MAX_JOBS", None),
+    "MAX_JOBS": lambda: os.getenv("MAX_JOBS") or None,
     # Number of threads to use for nvcc
     # By default this is 1.
     # If set, `MAX_JOBS` will be reduced to avoid oversubscribing the CPU.
-    "NVCC_THREADS": lambda: os.getenv("NVCC_THREADS", None),
+    "NVCC_THREADS": lambda: os.getenv("NVCC_THREADS") or None,
     # If set, vllm will use precompiled native binaries (*.so and vllm-rs).
     "VLLM_USE_PRECOMPILED": lambda: (
         os.environ.get("VLLM_USE_PRECOMPILED", "").strip().lower() in ("1", "true")
@@ -1178,12 +1178,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
     ),
     # Custom quick allreduce kernel for MI3* cards
-    # Choice of quantization level: FP, INT8, INT6, INT4 or NONE
+    # Choice of quantization level: FP, INT8, INT6, INT4, FP4, INT3 or NONE
     # Recommended for large models to get allreduce
     "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION": env_with_choices(
         "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION",
         "NONE",
-        ["FP", "INT8", "INT6", "INT4", "NONE"],
+        ["FP", "INT8", "INT6", "INT4", "FP4", "INT3", "NONE"],
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Due to the lack of the bfloat16 asm instruction, bfloat16
